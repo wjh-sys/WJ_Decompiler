@@ -1,0 +1,6 @@
+pyelftools>=0.30
+pefile>=2024.0
+capstone>=5.0
+openai>=1.0
+# verify_exp.py(EXP 自动验证)需要,且须在 WSL/Linux 环境运行
+pwntools>=4.0

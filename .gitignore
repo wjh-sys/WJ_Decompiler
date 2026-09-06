@@ -1,0 +1,26 @@
+# d:\CODE\WJ_Decompiler\.gitignore
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行产物
+reports/
+report_*.json
+
+# IDE / 系统
+.idea/
+.vscode/
+*.i64
+*.idb
+.DS_Store
+Thumbs.db
+
+# 本地配置(含可能的密钥)
+.env
+
+# CTF 题库样本(第三方题目,体积大,不上传)
+test/
+algorithm/
