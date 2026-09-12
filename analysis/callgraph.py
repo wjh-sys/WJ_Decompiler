@@ -7,7 +7,7 @@ from codegen import CGenerator
 from disasm import Disassembler
 from ir import Lifter, Op
 
-from .function_finder import FunctionFinder
+from .function_finder import FunctionFinder, decode_function_body
 
 @dataclass
 class CallTarget:
@@ -57,18 +57,8 @@ class CallGraph:
             ))
         return targets
 
-    def _decode_body(self, addr: int, max_bytes: int = 0x4000):
-        sec = self.prog.find_section(addr)
-        if sec is None:
-            return []
-        offset = addr - sec.addr
-        out = []
-        for ins in self.dis.decode(sec.data[offset:offset + max_bytes], addr):
-            out.append(ins)
-            if ins.mnemonic == "ret" or (ins.mnemonic.startswith("rep")
-                                          and ins.mnemonic.endswith("ret")):
-                break
-        return out
+    def _decode_body(self, addr: int):
+        return decode_function_body(self.dis, self.prog, addr, self._func_addrs)
 
     def _decompile(self, addr: int) -> str:
         ir = Lifter(self.dis).lift(self._decode_body(addr))

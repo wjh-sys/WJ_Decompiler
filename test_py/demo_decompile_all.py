@@ -8,6 +8,7 @@ from disasm import Disassembler
 from ir import Lifter, Op
 from codegen import CGenerator
 from analysis import CallGraph
+from analysis.function_finder import decode_function_body
 
 def main():
     if len(sys.argv) != 2:
@@ -65,14 +66,7 @@ def main():
         marker = "  (外部/libc)" if is_external else ""
         print(f"// ====== {name}{marker} ======")
         print(f"// 0x{addr:x}")
-        sec = prog.find_section(addr)
-        code = sec.data[addr - sec.addr:] if sec else b""
-        instrs = dis.decode(code, addr)
-        body = []
-        for ins in instrs:
-            body.append(ins)
-            if ins.mnemonic in ("ret", "jmp"):
-                break
+        body = decode_function_body(dis, prog, addr, graph._func_addrs)
         print("汇编：")
         for ins in body:
             raw = " ".join(f"{b:02x}" for b in ins.bytes)

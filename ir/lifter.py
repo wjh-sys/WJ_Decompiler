@@ -10,6 +10,9 @@ REG_SIZE = {
     "eax": 32, "ebx": 32, "ecx": 32, "edx": 32, "esi": 32, "edi": 32, "ebp": 32, "esp": 32,
 }
 
+_SAVED_REGS = {"ebp", "ebx", "esi", "edi"}
+_SP_REGS = ("esp", "rsp")
+
 _JCC = {
     "je": "==", "jz": "==",
     "jne": "!=", "jnz": "!=",
@@ -64,6 +67,7 @@ class Lifter:
         if m == "leave":
             out.append(IRInst(Op.ASSIGN, dst=Var("esp", 32), src=Var("ebp", 32)))
             out.append(IRInst(Op.ASSIGN, dst=Var("ebp", 32), src=Mem(Var("esp", 32), 32)))
+            self._pending_args.clear()
             return True
         if m in ("cmp", "test"):
             return self._cmp(m, ops)
@@ -71,7 +75,11 @@ class Lifter:
             return self._branch(ops, out, None)
         if m.startswith("j") and len(ops) == 1:
             return self._branch(ops, out, m)
-        if m in ("push", "pop", "nop", "hlt", "int"):
+        if m == "push":
+            return self._push(ops)
+        if m == "pop":
+            return self._pop(ops)
+        if m in ("nop", "hlt", "int"):
             return True
         return False
 
@@ -83,7 +91,10 @@ class Lifter:
             out.append(IRInst(Op.ASSIGN, dst=dst, src=tmp))
             return True
         out.append(IRInst(Op.ASSIGN, dst=dst, src=src))
-        self._maybe_record_arg(dst, src)
+        if isinstance(dst, Var) and dst.name in _SP_REGS:
+            self._pending_args.clear()
+        else:
+            self._maybe_record_arg(dst, src)
         return True
 
     def _lea(self, ops, out) -> bool:
@@ -107,13 +118,14 @@ class Lifter:
         else:
             self._last_alu = result
             self._last_cmp = None
+        self._track_sp(op, dst, src)
         return True
 
     def _call(self, ops, out) -> bool:
         if not ops:
             return False
         target = ops[0]
-        args = [self._pending_args[o] for o in sorted(self._pending_args)]
+        args = [self._pending_args[o] for o in sorted(self._pending_args) if o >= 0]
         if isinstance(target, Const):
             out.append(IRInst(Op.CALL, dst=Var("eax", 32), target=target.val, args=args))
         else:
@@ -131,6 +143,45 @@ class Lifter:
                 pass
         if isinstance(dst, Mem) and isinstance(dst.addr, Var) and dst.addr.name == "esp":
             self._pending_args[0] = src
+
+    @property
+    def _is32(self) -> bool:
+        prog = getattr(self.dis, "prog", None)
+        return getattr(prog, "bits", 32) == 32
+
+    def _shift_args(self, delta: int) -> None:
+        """esp 变化时平移已记录实参的栈偏移(值在栈上的相对位置不变)."""
+        if not self._pending_args or not delta:
+            return
+        self._pending_args = {k + delta: v for k, v in self._pending_args.items()}
+
+    def _track_sp(self, op: str, dst: Expr, src: Expr) -> None:
+        """跟踪 esp 的 add/sub: 平移已记录实参; 无法静态确定时清空."""
+        if not (isinstance(dst, Var) and dst.name in _SP_REGS):
+            return
+        if op in ("add", "sub") and isinstance(src, Const):
+            self._shift_args(-src.val if op == "add" else src.val)
+        else:
+            self._pending_args.clear()
+
+    def _push(self, ops) -> bool:
+        """32 位 cdecl: push 的实参入栈, esp 下移 4 字节, 此时值位于 [esp+0]."""
+        if not ops:
+            return False
+        if not self._is32:
+            return True
+        src = ops[0]
+        if isinstance(src, Var) and src.name in _SAVED_REGS:
+            return True
+        self._shift_args(4)
+        self._pending_args[0] = src
+        return True
+
+    def _pop(self, ops) -> bool:
+        """pop 抬升 esp: 平移已记录实参, 丢弃出栈的值."""
+        if self._is32 and self._pending_args:
+            self._pending_args = {k + 4: v for k, v in self._pending_args.items() if k + 4 >= 0}
+        return True
 
     def _cmp(self, m, ops) -> bool:
         if len(ops) != 2:

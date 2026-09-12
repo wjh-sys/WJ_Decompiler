@@ -22,7 +22,7 @@ import sys
 
 from loader import guess_loader
 from disasm import Disassembler
-from analysis.function_finder import FunctionFinder
+from analysis.function_finder import FunctionFinder, decode_function_body
 from ir import Lifter
 from codegen import CGenerator
 
@@ -255,14 +255,7 @@ def cmd_c(prog, dis, symtab, start=None, stop=None, max_funcs: int = 200) -> Non
         sec = prog.find_section(addr)
         if sec is None:
             continue
-        # 反汇编函数体:到首个 ret 结束
-        off = addr - sec.addr
-        body = []
-        for ins in dis.decode(sec.data[off:off + 0x4000], addr):
-            body.append(ins)
-            if ins.mnemonic == "ret" or (ins.mnemonic.startswith("rep")
-                                          and ins.mnemonic.endswith("ret")):
-                break
+        body = decode_function_body(dis, prog, addr, addrs)
         if not body:
             continue
         print(f"\n// ====== {name} @ 0x{addr:x} ======")

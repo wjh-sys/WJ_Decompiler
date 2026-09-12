@@ -177,6 +177,7 @@ python3 verify_exp.py ./ret2text reports/ret2text.json
 ├── codegen/    # 伪代码生成
 │   ├── __init__.py
 │   ├── c_generator.py
+│
 ├── disasm/    # 反汇编
 │   ├── __init__.py
 │   ├── disassembler.py
@@ -198,7 +199,7 @@ python3 verify_exp.py ./ret2text reports/ret2text.json
 │   ├── elf_loader.py
 ├── algorithm/    # 算法(伪代码/设计演示)
 │   ├── Algorithm_1.py    # Taint 优化闭环伪代码
-│   ├── Algorithm_2.py    # 暂定为某优化算法，暂未想好
+│   ├── Algorithm_2.py    # 暂定为某优化算法，暂未想好名称
 ├── test/    # 测试样本(CTF pwn 题库)
 │   ├── user-mode/        # stackoverflow / fmtstr / heap / arm / mips / ...
 ├── test_py/    # 实验/调试脚本
@@ -289,24 +290,16 @@ CLI 入口:
 
 
 ## 已知限制
-- 循环等结构化控制流未恢复（跳转已建模为平坦的 `label + if/goto`，尚未折叠成 `if/while`）
-- 标志位已建模：`cmp/test` 及算术/逻辑指令（`sub/add/and/or/xor/shl/shr/sar`）后的条件跳转均可还原为真实条件（⚠ `ja/jae/jb/jbe` 暂按有符号比较处理）
-- 间接调用目标为运行期值，伪代码显示为 `(*eax)()` / `(*(int*)(...))()`，静态分析不还原具体地址
-- 变量未命名（暂用寄存器名 eax/esp），无类型恢复
 - python wjdump后展示的代码字符结构不够美观，second edition着重强调将工具系统化正规化
---> 此五类为第三版着重解决的问题，侧重于实用性，第二版着重于实现Algorithm_1的落地实现
 
 - 仅支持 ELF（x86/x86-64/arm/aarch64），不支持 PE
 --> 这个是第四版需要解决的问题，着重于拓展分析程序边界
 
-- **栈溢出能力** → **第二版已实现，但解题率有限**：已建立 11 题评测基线，**漏洞识别/偏移定位 9/11、技术路线同官方 9/11**，但**端到端 PASS 仅 1/11**；公共卡点为 `stage_runtime`（多阶段交互时序）
-- **堆溢出 / 格式化字符串 / 整数溢出 / ROP 链高级技巧（ret2dlresolve、SROP、BROP、栈迁移）** → **第二版未覆盖**，当前分析聚焦栈溢出
+- **栈溢出能力** → **第二版已实现，但解题率有限**：已建立 11 题评测基线，**漏洞识别/偏移定位 9/11、技术路线同官方 9/11**，但**端到端 PASS 仅 1/11**；公共卡点为 `stage_runtime`（多阶段交互时序） -->后期再进行优化，先不管
+- **堆溢出 / 格式化字符串 / 整数溢出 / ROP 链高级技巧（ret2dlresolve、SROP、BROP、栈迁移）** → **第二版未覆盖**，当前分析聚焦栈溢出 -->主要是算法的更新以及功能的完善
 - **全静态大体积二进制** → 仍被 `is_large_static` 跳过（无 PLT 符号可识别 source）
 
 ## 下一步规划
-- [ ] CFG 构建 + 控制结构恢复（if/while，将平坦 `label + goto` 折叠为结构化语句）
-- [ ] 栈参数抑制（清理 CALL 前的 `*(esp+X)=v` 噪声）
-- [ ] 变量命名 + 类型恢复
 - [ ] 对于python wjdump后的每一个通道字功能（如-s，-c，etc）都一个一个实验，一个一个修改即可
 - [ ] **提升端到端解题率（最高优先）**：评测显示 `stage_runtime`（多阶段交互时序）在 11 题中全部命中，优先加固泄漏读取与交互建模
 - [ ] 扩展 pwn 覆盖面：堆溢出 / 格式化字符串 / 整数溢出分析（第二版仅覆盖栈溢出）

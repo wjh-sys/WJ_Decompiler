@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from ir import IRInst, Op
 from ir.expressions import BinOp, Const, Expr, Mem, Var
+from ir.naming import recover, rename_registers
+from .cfg import Structurer
 
 _RET_SIZE = 32
 
 class CGenerator:
     def __init__(self, prog=None) -> None:
-        self._suppress_offsets: set[int] = set()
         self._prog = prog
         self._sym_map: dict[int, str] = {}
         if prog is not None:
@@ -16,75 +17,76 @@ class CGenerator:
                     self._sym_map[s.addr] = s.name
 
     def generate(self, insts: list[IRInst]) -> str:
+        insts = self._suppress_stack_args(insts)
+        insts, vinfo = recover(insts, self._prog)
+        rename_registers(insts)
+        body: list[str] = []
+        if vinfo is not None and vinfo.types:
+            decls = "; ".join(self._decl(n, t) for n, t in sorted(vinfo.types.items()))
+            body.append(f"    // 恢复变量: {decls}")
+        body += Structurer(insts, self).structurize()
+        return "\n".join(body)
+
+    @staticmethod
+    def _decl(name: str, typ: str) -> str:
+        if "[" in typ:
+            base, arr = typ.split("[", 1)
+            return f"{base} {name}[{arr}"
+        return f"{typ} {name}"
+
+    def _fmt_inst(self, inst: IRInst):
+        if inst.op == Op.ASSIGN:
+            return self._fmt_assign(inst)
+        if inst.op == Op.CALL:
+            return self._fmt_call(inst)
+        if inst.op == Op.RET:
+            return self._fmt_ret(inst)
+        if inst.op == Op.UNKN:
+            return f"// 未实现: {inst.raw}"
+        return None
+
+    def _render_insts(self, insts: list[IRInst]) -> list[str]:
         lines: list[str] = []
-        labels = {x.target for x in insts if x.op == Op.BRANCH and x.target}
         i = 0
         n = len(insts)
         while i < n:
             inst = insts[i]
             nxt = insts[i + 1] if i + 1 < n else None
             n2 = insts[i + 2] if i + 2 < n else None
-
-            if inst.addr and inst.addr in labels:
-                lines.append(f"L_{inst.addr:x}:")
-
             if self._is_prologue(inst, nxt, n2):
-                lines.append("    // 序言")
+                lines.append("// 序言")
                 i += 3
                 continue
             if self._is_epilogue_block(inst, nxt):
-                lines.append("    // 尾声")
+                lines.append("// 尾声")
                 i += 2
                 continue
-
-            if inst.op == Op.ASSIGN:
-                if self._should_suppress(inst):
-                    i += 1
-                    continue
-                # 栈参数抑制(前瞻): 若从当前位置起是连续 esp 栈赋值,且其后
-                # 紧跟 CALL,则这些赋值是栈传参实现细节(已聚合进 CALL.args),
-                # 整体跳过只输出 CALL
-                hit = self._skip_until_call(insts, i)
-                if hit is not None:
-                    nxt_call, nxt_call_index = hit
-                    lines.append("    " + self._fmt_call(nxt_call))
-                    i = nxt_call_index + 1
-                    continue
-                lines.append("    " + self._fmt_assign(inst))
-            elif inst.op == Op.CALL:
-                lines.append("    " + self._fmt_call(inst))
-            elif inst.op == Op.RET:
-                lines.append("    " + self._fmt_ret(inst))
-            elif inst.op == Op.CMP:
-                pass
-            elif inst.op == Op.BRANCH:
-                tgt = f"L_{inst.target:x}" if inst.target else "?"
-                if isinstance(inst.cond, Var):
-                    lines.append(f"    // IF <flags from {inst.cond.name}> goto {tgt};")
-                elif inst.cond is not None:
-                    lines.append(f"    if ({self._fmt_cond(inst.cond)}) goto {tgt};")
-                else:
-                    lines.append(f"    goto {tgt};")
-            elif inst.op == Op.UNKN:
-                lines.append(f"    // 未实现: {inst.raw}")
+            ln = self._fmt_inst(inst)
+            if ln is not None:
+                lines.append(ln)
             i += 1
-        return "\n".join(lines)
+        return lines
 
-    def _skip_until_call(self, insts: list[IRInst], start: int):
-        """从 start 起若为连续 *(esp+X)=v 赋值且其后紧跟 CALL,返回
-        (call, index);否则返回 None. 被跳过的偏移记入 _suppress_offsets."""
-        j = start
-        offs = set()
-        while j < len(insts) and insts[j].op == Op.ASSIGN:
-            off = _esp_offset(insts[j].dst.addr) if isinstance(insts[j].dst, Mem) else None
-            if off is None:
-                break
-            offs.add(off)
-            j += 1
-        if not offs or j >= len(insts) or insts[j].op != Op.CALL:
-            return None
-        self._suppress_offsets |= offs
-        return insts[j], j
+    def _suppress_stack_args(self, insts: list[IRInst]) -> list[IRInst]:
+        """清理 CALL 前连续 *(esp+X)=v 的栈传参噪声(已聚合进 CALL.args)."""
+        keep = [True] * len(insts)
+        j = 0
+        while j < len(insts):
+            dst = insts[j].dst
+            if (insts[j].op == Op.ASSIGN and isinstance(dst, Mem)
+                    and _esp_offset(dst.addr) is not None):
+                k = j
+                while (k < len(insts) and insts[k].op == Op.ASSIGN
+                       and isinstance(insts[k].dst, Mem)
+                       and _esp_offset(insts[k].dst.addr) is not None):
+                    k += 1
+                if k < len(insts) and insts[k].op == Op.CALL:
+                    for x in range(j, k):
+                        keep[x] = False
+                j = k
+            else:
+                j += 1
+        return [inst for inst, ok in zip(insts, keep) if ok]
 
     def _is_prologue(self, a, b, c) -> bool:
         if not (a and b and c):
@@ -104,15 +106,6 @@ class CGenerator:
         ok0 = isinstance(a.dst, Var) and a.dst.name == "esp" and isinstance(a.src, Var) and a.src.name == "ebp"
         ok1 = isinstance(b.dst, Var) and b.dst.name == "ebp"
         return ok0 and ok1
-
-    def _should_suppress(self, inst: IRInst) -> bool:
-        dst = inst.dst
-        if not isinstance(dst, Mem):
-            return False
-        off = _esp_offset(dst.addr)
-        if off is None:
-            return False
-        return off in self._suppress_offsets
 
     def _fmt_assign(self, inst: IRInst) -> str:
         dst = self._fmt_expr(inst.dst)
