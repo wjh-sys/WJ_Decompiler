@@ -20,7 +20,7 @@ class LLMConfig:
     max_retries: int = 1
 
 def load_config() -> LLMConfig:
-    key = os.environ.get("LLM_API_KEY", "").strip()
+    key = os.environ.get("LLM_API_KEY", "sk-637d403cf9904407aabb3e8875697df3").strip() #   填充API密钥
     if not key:
         raise LLMConfigError(
             "未找到 LLM_API_KEY 环境变量。\n"

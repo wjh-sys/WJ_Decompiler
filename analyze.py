@@ -87,6 +87,42 @@ def _print_report(report) -> None:
             print(f"  验证方式  : {ep.verification}")
     print(line)
 
+class LargeStaticError(RuntimeError):
+    pass
+
+def round_zero(binary: str, addr: str | None, depth: int, max_nodes: int, config):
+    """Algorithm 1 第 1 行: RoundZero(B) -> (J0, I). 单次完整流水线."""
+    if not os.path.isfile(binary):
+        raise FileNotFoundError(
+            f"目标二进制不存在: {binary}\n"
+            f"请检查路径(项目内题目多为多层嵌套目录, 例如 "
+            f"test/user-mode/stackoverflow/ret2text/bamboofox-ret2text/ret2text)")
+    prog = guess_loader(binary).load()
+    dis = Disassembler(prog)
+    if is_large_static(prog, binary):
+        raise LargeStaticError(
+            "该文件为全静态大体积二进制,当前工具链不支持"
+            "(函数发现误报多、无 PLT 符号可识别 source),请换动态链接题目")
+    graph = CallGraph(prog, dis)
+    graph.build()
+    root = _find_root(prog, dis, addr)
+    nodes = graph.expand(root, max_depth=depth, max_nodes=max_nodes)
+    if not nodes:
+        raise RuntimeError(f"根函数 0x{root:x} 展开结果为空，无法分析")
+    print(f"[*] 根函数 0x{root:x}，展开 {len(nodes)} 个函数"
+          f"（深度≤{depth}，节点≤{max_nodes}），正在请求模型分析...")
+    ev = taint_analyze(prog, graph, binary)
+    messages = build_messages(
+        build_prog_info(prog),
+        build_graph_text(graph, nodes),
+        nodes,
+        evidence_text=ev.to_prompt_text(),
+    )
+    client = LLMClient(config)
+    raw = client.chat(messages)
+    report = parse_report(raw)
+    return report, ev, nodes, prog, graph, root
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="analyze",
@@ -111,44 +147,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        prog = guess_loader(args.binary).load()
-        dis = Disassembler(prog)
-    except Exception as exc:
-        print(f"[错误] 无法加载二进制 {args.binary}: {exc}", file=sys.stderr)
-        return 1
-
-    if is_large_static(prog, args.binary):
-        print(f"[跳过] 该文件为全静态大体积二进制,当前工具链不支持"
-              f"(函数发现误报多、无 PLT 符号可识别 source),请换动态链接题目", file=sys.stderr)
+        report, ev, nodes, prog, graph, root = round_zero(
+            args.binary, args.addr, args.depth, args.max_nodes, config)
+    except LargeStaticError as exc:
+        print(f"[跳过] {exc}", file=sys.stderr)
         return 2
-
-    graph = CallGraph(prog, dis)
-    graph.build()
-    root = _find_root(prog, dis, args.addr)
-    nodes = graph.expand(root, max_depth=args.depth, max_nodes=args.max_nodes)
-    if not nodes:
-        print(f"[错误] 根函数 0x{root:x} 展开结果为空，无法分析", file=sys.stderr)
-        return 1
-
-    ev = taint_analyze(prog, graph, args.binary)
-    evidence_text = ev.to_prompt_text()
-
-    print(f"[*] 根函数 0x{root:x}，展开 {len(nodes)} 个函数"
-          f"（深度≤{args.depth}，节点≤{args.max_nodes}），正在请求模型分析...")
-    messages = build_messages(
-        build_prog_info(prog),
-        build_graph_text(graph, nodes),
-        nodes,
-        evidence_text=evidence_text,
-    )
-    try:
-        client = LLMClient(config)
-        raw = client.chat(messages)
     except LLMError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return 1
-
-    report = parse_report(raw)
+    except Exception as exc:
+        print(f"[错误] 无法加载/分析二进制 {args.binary}: {exc}", file=sys.stderr)
+        return 1
     _print_report(report)
     if args.json_out:
         try:

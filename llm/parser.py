@@ -4,7 +4,8 @@ import ast
 import json
 import re
 
-from .schema import VULN_TYPES, DangerPoint, ExploitPlan, VulnDetails, VulnReport
+from .schema import (PROBLEM_KINDS, VULN_TYPES, DangerPoint, ExploitPlan,
+                     FailureAnalysis, Problem, VulnDetails, VulnReport)
 
 def parse_report(raw: str) -> VulnReport:
     obj = _try_load(raw)
@@ -99,3 +100,26 @@ def _as_int(v):
 def _as_type(v) -> str:
     s = _as_str(v).strip().lower()
     return s if s in VULN_TYPES else "none"
+
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "1", "yes", "y")
+
+def parse_analysis(raw: str) -> FailureAnalysis:
+    obj = _try_load(raw)
+    if obj is None:
+        return FailureAnalysis(reasoning=raw[:500] or "(空响应)")
+    a = FailureAnalysis()
+    a.score = _as_float(obj.get("score"))
+    a.actually_passed = _as_bool(obj.get("actually_passed"))
+    for p in obj.get("problems") or []:
+        if isinstance(p, dict):
+            a.problems.append(Problem(
+                kind=_as_str(p.get("kind")).strip(),
+                detail=_as_str(p.get("detail")),
+                target=_as_str(p.get("target")),
+            ))
+    a.locked = _as_str_list(obj.get("locked"))
+    a.reasoning = _as_str(obj.get("reasoning"))
+    return a

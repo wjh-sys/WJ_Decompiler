@@ -1,6 +1,5 @@
 from .base import BaseLoader, Program, Section, Symbol
 from .elf_loader import ElfLoader
-from .pe_loader import PeLoader
 
 __all__ = [
     "BaseLoader",
@@ -8,16 +7,13 @@ __all__ = [
     "Section",
     "Symbol",
     "ElfLoader",
-    "PeLoader",
     "guess_loader",
 ]
 
-def guess_loader(path: str) ->BaseLoader:
+def guess_loader(path: str) -> BaseLoader:
     with open(path, "rb") as f:
         data = f.read(4)
         if data == b"\x7fELF":
             return ElfLoader(path)
-        elif data == b"MZ":
-            return PeLoader(path)
         else:
-            raise ValueError("Unknown file format")
+            raise ValueError("Unknown file format (仅支持 ELF)")

@@ -93,3 +93,41 @@ JSON_SCHEMA = {
                  "danger_points", "details", "exploitation", "false_positive_reason",
                  "exploit_plan"],
 }
+
+PROBLEM_KINDS = [
+    "addr_missing", "gadget_missing", "need_leak", "string_missing",
+    "offset_wrong", "payload_fix", "stage_runtime", "misread",
+]
+
+@dataclass
+class Problem:
+    kind: str = ""
+    detail: str = ""
+    target: str = ""
+
+@dataclass
+class FailureAnalysis:
+    score: float = 0.0
+    actually_passed: bool = False
+    problems: list = field(default_factory=list)
+    locked: list = field(default_factory=list)
+    reasoning: str = ""
+
+ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 1,
+                  "description": "对当前 EXP 完成度的评估(0~1),达到阈值即收敛"},
+        "actually_passed": {"type": "boolean",
+                            "description": "若证据表明 EXP 其实已打通(仅探活误判),置 true"},
+        "problems": {"type": "array", "items": {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": PROBLEM_KINDS},
+            "detail": {"type": "string"},
+            "target": {"type": "string"},
+        }}, "description": "把客观证据翻译成的结构化问题清单"},
+        "locked": {"type": "array", "items": {"type": "string"},
+                   "description": "本轮确凿、下一轮禁止改动的字段路径,如 exploit_plan.offset"},
+        "reasoning": {"type": "string", "description": "归因简述"},
+    },
+    "required": ["score", "actually_passed", "problems", "locked", "reasoning"],
+}

@@ -10,10 +10,25 @@ REG_SIZE = {
     "eax": 32, "ebx": 32, "ecx": 32, "edx": 32, "esi": 32, "edi": 32, "ebp": 32, "esp": 32,
 }
 
+_JCC = {
+    "je": "==", "jz": "==",
+    "jne": "!=", "jnz": "!=",
+    "jg": ">", "jnle": ">",
+    "jge": ">=", "jnl": ">=",
+    "jl": "<", "jnge": "<",
+    "jle": "<=", "jng": "<=",
+    "ja": ">", "jnbe": ">",
+    "jae": ">=", "jnb": ">=", "jnc": ">=",
+    "jb": "<", "jnae": "<", "jc": "<",
+    "jbe": "<=", "jna": "<=",
+}
+
 class Lifter:
     def __init__(self, dis: Disassembler):
         self.dis = dis
         self._pending_args: dict[int, Expr] = {}
+        self._last_cmp = None
+        self._last_alu = None
 
     def lift_text(self) -> list[IRInst]:
         return self.lift(self.dis.decode_text())
@@ -21,9 +36,13 @@ class Lifter:
     def lift(self, instrs: list[Instruction]) -> list[IRInst]:
         out: list[IRInst] = []
         for ins in instrs:
+            start = len(out)
             handled = self._dispatch(ins, out)
             if not handled:
                 out.append(IRInst(Op.UNKN, raw=str(ins)))
+            for k in range(start, len(out)):
+                if out[k].addr == 0:
+                    out[k].addr = ins.addr
         return out
 
     def _dispatch(self, ins: Instruction, out: list[IRInst]) -> bool:
@@ -33,18 +52,25 @@ class Lifter:
             return self._mov(ops, out)
         if m == "lea":
             return self._lea(ops, out)
-        if m in ("add", "sub", "and", "or", "xor", "shl", "shr"):
+        if m in ("add", "sub", "and", "or", "xor", "shl", "shr", "sar"):
             return self._alu(m, ops, out)
         if m == "call":
             return self._call(ops, out)
-        if m == "ret":
+        if m == "ret" or (m.startswith("rep") and m.endswith("ret")):
             out.append(IRInst(Op.RET, src=Var("eax", 32)))
             self._pending_args.clear()
+            self._last_cmp = self._last_alu = None
             return True
         if m == "leave":
             out.append(IRInst(Op.ASSIGN, dst=Var("esp", 32), src=Var("ebp", 32)))
             out.append(IRInst(Op.ASSIGN, dst=Var("ebp", 32), src=Mem(Var("esp", 32), 32)))
             return True
+        if m in ("cmp", "test"):
+            return self._cmp(m, ops)
+        if m == "jmp":
+            return self._branch(ops, out, None)
+        if m.startswith("j") and len(ops) == 1:
+            return self._branch(ops, out, m)
         if m in ("push", "pop", "nop", "hlt", "int"):
             return True
         return False
@@ -69,18 +95,31 @@ class Lifter:
         return False
 
     def _alu(self, op, ops, out) -> bool:
+        if len(ops) != 2:
+            return False
         dst, src = ops[0], ops[1]
         size = getattr(dst, "size", 32)
-        out.append(IRInst(Op.ASSIGN, dst=dst, src=BinOp(op, dst, src, size)))
+        result = BinOp(op, dst, src, size)
+        out.append(IRInst(Op.ASSIGN, dst=dst, src=result))
+        if op == "sub":
+            self._last_cmp = ("sub", dst, src)
+            self._last_alu = None
+        else:
+            self._last_alu = result
+            self._last_cmp = None
         return True
 
     def _call(self, ops, out) -> bool:
-        target = ops[0]
-        if not isinstance(target, Const):
+        if not ops:
             return False
+        target = ops[0]
         args = [self._pending_args[o] for o in sorted(self._pending_args)]
-        out.append(IRInst(Op.CALL, dst=Var("eax", 32), target=target.val, args=args))
+        if isinstance(target, Const):
+            out.append(IRInst(Op.CALL, dst=Var("eax", 32), target=target.val, args=args))
+        else:
+            out.append(IRInst(Op.CALL, dst=Var("eax", 32), args=args, indirect=target))
         self._pending_args.clear()
+        self._last_cmp = self._last_alu = None
         return True
 
     def _maybe_record_arg(self, dst: Expr, src: Expr) -> None:
@@ -92,6 +131,35 @@ class Lifter:
                 pass
         if isinstance(dst, Mem) and isinstance(dst.addr, Var) and dst.addr.name == "esp":
             self._pending_args[0] = src
+
+    def _cmp(self, m, ops) -> bool:
+        if len(ops) != 2:
+            return False
+        self._last_cmp = (m, ops[0], ops[1])
+        self._last_alu = None
+        return True
+
+    def _branch(self, ops, out, mnem) -> bool:
+        if not ops or not isinstance(ops[0], Const):
+            return False
+        cond = None
+        if mnem is not None:
+            cond = self._condition(mnem) or Var(mnem, 1)
+        out.append(IRInst(Op.BRANCH, target=ops[0].val, cond=cond))
+        return True
+
+    def _condition(self, mnem) -> Expr | None:
+        rel = _JCC.get(mnem)
+        if rel is None:
+            return None
+        if self._last_cmp is not None:
+            kind, lhs, rhs = self._last_cmp
+            if kind == "test" and rhs == lhs:
+                rhs = Const(0, 32)
+            return BinOp(rel, lhs, rhs, 32)
+        if self._last_alu is not None:
+            return BinOp(rel, self._last_alu, Const(0, 32), 32)
+        return None
 
     def _parse_ops(self, op_str: str) -> list[Expr]:
         op_str = op_str.strip()

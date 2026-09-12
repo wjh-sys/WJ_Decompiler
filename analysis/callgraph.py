@@ -48,6 +48,8 @@ class CallGraph:
         for inst in ir:
             if inst.op != Op.CALL:
                 continue
+            if inst.target is None:
+                continue
             targets.append(CallTarget(
                 callee=inst.target or 0,
                 args=[str(a) for a in inst.args],

@@ -1,9 +1,13 @@
 from dataclasses import dataclass
 from capstone import (
     Cs,
-    CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_AARCH64,
+    CS_ARCH_X86, CS_ARCH_ARM,
     CS_MODE_32, CS_MODE_64, CS_MODE_ARM,
 )
+try:
+    from capstone import CS_ARCH_AARCH64
+except ImportError:
+    from capstone import CS_ARCH_ARM64 as CS_ARCH_AARCH64
 
 from loader import Program
 

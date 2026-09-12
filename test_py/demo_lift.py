@@ -1,4 +1,8 @@
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from loader import guess_loader
 from disasm import Disassembler
 from ir import Lifter

@@ -8,6 +8,7 @@
     python wjdump.py -s <binary>                 # hex dump 所有节区内容
     python wjdump.py -s -j .rodata <binary>      # hex dump 指定节区
     python wjdump.py -t <binary>                 # 符号表
+    python wjdump.py -C <binary>                 # 各函数 C 伪代码
     python wjdump.py -d -j .text --start-address=0x8048648 --stop-address=0x80486c8 <bin>
     python wjdump.py -d -M intel <binary>        # 指定语法 intel/att
 
@@ -21,6 +22,9 @@ import sys
 
 from loader import guess_loader
 from disasm import Disassembler
+from analysis.function_finder import FunctionFinder
+from ir import Lifter
+from codegen import CGenerator
 
 SYNTAX = ("intel", "att")
 
@@ -229,6 +233,46 @@ def cmd_t(prog):
         sec = s.section or "*UND*"
         print(f"{s.addr:016x} {bind} {typ:>{typ_w}} {sec:<{sec_w+2}} {s.name}")
 
+
+def cmd_c(prog, dis, symtab, start=None, stop=None, max_funcs: int = 200) -> None:
+    """生成各函数的 C 伪代码(反汇编 -> IR -> CGenerator)."""
+    if prog.arch not in ("x86", "x86_64"):
+        print("[提示] -C 伪代码生成暂仅支持 x86/x86-64", file=sys.stderr)
+        return
+    try:
+        addrs = FunctionFinder(prog, dis).find(max_verify=max_funcs)
+    except Exception as exc:
+        print(f"[错误] 函数发现失败: {exc}", file=sys.stderr)
+        return
+    if start is not None:
+        addrs = [a for a in addrs if a >= start]
+    if stop is not None:
+        addrs = [a for a in addrs if a < stop]
+    gen = CGenerator(prog)
+    lf = Lifter(dis)
+    for addr in addrs[:max_funcs]:
+        name = symtab.get(addr, f"sub_{addr:x}")
+        sec = prog.find_section(addr)
+        if sec is None:
+            continue
+        # 反汇编函数体:到首个 ret 结束
+        off = addr - sec.addr
+        body = []
+        for ins in dis.decode(sec.data[off:off + 0x4000], addr):
+            body.append(ins)
+            if ins.mnemonic == "ret" or (ins.mnemonic.startswith("rep")
+                                          and ins.mnemonic.endswith("ret")):
+                break
+        if not body:
+            continue
+        print(f"\n// ====== {name} @ 0x{addr:x} ======")
+        ir = lf.lift(body)
+        print("void func() {")
+        c = gen.generate(ir)
+        print(c if c else "    // (空函数体)")
+        print("}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="wjdump",
@@ -243,13 +287,14 @@ def main(argv=None) -> int:
     ap.add_argument("-D", action="store_true", help="反汇编所有节区(含数据)")
     ap.add_argument("-s", action="store_true", help="hex dump 节区内容")
     ap.add_argument("-t", action="store_true", help="显示符号表")
+    ap.add_argument("-C", action="store_true", help="生成函数 C 伪代码")
     ap.add_argument("-j", metavar="SECTION", default=None, help="仅处理指定节区")
     ap.add_argument("--start-address", default=None, help="反汇编起始地址")
     ap.add_argument("--stop-address", default=None, help="反汇编结束地址(不含)")
     ap.add_argument("-M", default=None, choices=SYNTAX, help="汇编语法 intel/att")
     args = ap.parse_args(argv)
 
-    if not any([args.f, args.h, args.d, args.D, args.s, args.t]):
+    if not any([args.f, args.h, args.d, args.D, args.s, args.t, args.C]):
         ap.print_help()
         return 2
 
@@ -277,6 +322,8 @@ def main(argv=None) -> int:
         cmd_s(prog, jsec=args.j)
     if args.t:
         cmd_t(prog)
+    if args.C:
+        cmd_c(prog, dis, symtab, start=start, stop=stop)
     return 0
 
 if __name__ == "__main__":

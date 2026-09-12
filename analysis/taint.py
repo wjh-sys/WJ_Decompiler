@@ -2,6 +2,7 @@
 # d:\CODE\WJ_Decompiler\analysis\taint.py
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -42,6 +43,7 @@ class OverflowSite:
     offset_to_ret: int
     why: str
     reachable: bool = False
+    reentry_offset: int | None = None
 
 @dataclass
 class Backdoor:
@@ -70,6 +72,7 @@ class Evidence:
     unreachable: list = field(default_factory=list)
     unsupported: bool = False
     note: str = ""
+    libc: dict = field(default_factory=dict)
 
     def to_prompt_text(self) -> str:
         L = []
@@ -109,6 +112,19 @@ class Evidence:
         L.append("[可利用目标]")
         for t in self.targets:
             L.append(f"  {t.kind:<9} {t.name}  {t.detail}")
+        if self.libc:
+            lc = self.libc
+            L.append("")
+            L.append("[同目录 libc 符号偏移](泄露基址后 真实地址 = libc_base + 偏移)")
+            L.append(f"  libc: {lc.get('path', '?')}")
+            for k in ("system", "__libc_start_main", "puts", "read", "write"):
+                if k in lc:
+                    L.append(f"  {k} = 0x{lc[k]:x}")
+            if "str_bin_sh" in lc:
+                L.append(f"  str_bin_sh(\"/bin/sh\") = 0x{lc['str_bin_sh']:x}")
+            if not any(t.name in ("system", "execve") for t in self.targets):
+                L.append("  提示: 目标无 system@plt, 但同目录 libc 含 system; "
+                         "疑需先泄漏 libc 基址(ret2libc 两阶段), 再 system('/bin/sh')")
         if self.strings:
             L.append("[可疑字符串]")
             for s in self.strings:
@@ -409,44 +425,71 @@ class TaintAnalyzer:
         cs = self.prog.code_section
         if cs is None or not self.is_x86:
             return []
-        want32 = {
+        want = {
             b"\x58\xc3": "pop eax; ret",
             b"\x59\xc3": "pop ecx; ret",
             b"\x5a\xc3": "pop edx; ret",
             b"\x5b\xc3": "pop ebx; ret",
             b"\x5f\xc3": "pop edi; ret",
             b"\x5e\xc3": "pop esi; ret",
+            b"\x5d\xc3": "pop ebp; ret",
+            b"\xc9\xc3": "leave; ret",
+            b"\x94\xc3": "xchg eax, esp; ret",
+            b"\x5a\x59\x5b\xc3": "pop edx; pop ecx; pop ebx; ret",
+            b"\x58\x59\x5a\x5b\xc3": "pop eax; pop ecx; pop edx; pop ebx; ret",
         }
-        want64 = {
-            b"\x5f\xc3": "pop rdi; ret",
-            b"\x5e\xc3": "pop rsi; ret",
-            b"\x5a\xc3": "pop rdx; ret",
-            b"\x58\xc3": "pop rax; ret",
-            b"\x5b\xc3": "pop rbx; ret",
-            b"\x41\x5f\xc3": "pop r15; ret",
-            b"\x41\x5e\xc3": "pop r14; ret",
-            b"\x41\x5c\xc3": "pop r12; ret",
-        }
-        want = want64 if self.bits == 64 else want32
-        # 32 位常用多弹: pop edx; pop ecx; pop ebx; ret  = 5a 59 5b c3
-        if self.bits == 32:
-            want[b"\x5a\x59\x5b\xc3"] = "pop edx; pop ecx; pop ebx; ret"
-            want[b"\x58\x59\x5a\x5b\xc3"] = "pop eax; pop ecx; pop edx; pop ebx; ret"
-        elif self.bits == 64:
-            want[b"\x41\x5c\x41\x5d\x41\x5e\x41\x5f\xc3"] = "pop r12; pop r13; pop r14; pop r15; ret"
+        if self.bits == 64:
+            want = {
+                b"\x5f\xc3": "pop rdi; ret",
+                b"\x5e\xc3": "pop rsi; ret",
+                b"\x5a\xc3": "pop rdx; ret",
+                b"\x58\xc3": "pop rax; ret",
+                b"\x5b\xc3": "pop rbx; ret",
+                b"\x41\x5f\xc3": "pop r15; ret",
+                b"\x41\x5e\xc3": "pop r14; ret",
+                b"\x41\x5c\xc3": "pop r12; ret",
+                b"\xc9\xc3": "leave; ret",
+                b"\x41\x5c\x41\x5d\x41\x5e\x41\x5f\xc3":
+                    "pop r12; pop r13; pop r14; pop r15; ret",
+            }
         data = cs.data
         base = cs.addr
         hits = {}
+
+        # 通道1: 预设签名(字节匹配, 与指令对齐无关, 覆盖多弹序列)
         for pat, desc in want.items():
             start = 0
-            plen = len(pat)
             while True:
                 idx = data.find(pat, start)
                 if idx < 0:
                     break
-                addr = base + idx
-                hits.setdefault(addr, desc)
+                hits.setdefault(base + idx, desc)
                 start = idx + 1
+
+        # 通道2: 滑窗反汇编(从每个偏移尝试解码, 收集以 ret 结尾的短 gadget)
+        ok_ops = {"pop", "nop", "leave", "xchg", "add", "sub", "xor",
+                  "mov", "inc", "dec", "and", "or", "shl", "shr", "sar",
+                  "neg", "not", "test"}
+        cap = min(len(data), 0x10000)
+        md = self.dis.cs
+        for i in range(cap):
+            seq = []
+            for ins in md.disasm(data[i:i + 16], base + i):
+                m = ins.mnemonic
+                if m in ("ret", "retf"):
+                    seq.append(ins)
+                    if len(seq) <= 5 and any(
+                            x.mnemonic in ("pop", "leave", "xchg") for x in seq):
+                        hits.setdefault(base + i,
+                                        "; ".join(f"{x.mnemonic} {x.op_str}".strip()
+                                                  for x in seq))
+                    break
+                if m not in ok_ops or "ptr [" in ins.op_str:
+                    break
+                seq.append(ins)
+                if len(seq) > 5:
+                    break
+
         if self.bits == 32:
             # int 0x80 单独处理(通常紧跟 ret 或不跟)
             start = 0
@@ -468,6 +511,9 @@ class TaintAnalyzer:
             ev.note = "taint 分析暂只支持 x86/x86-64"
             return ev
         ev.protections = detect_protections(self.prog, self.binary_path)
+        libc_path = _find_libc(self.binary_path)
+        if libc_path:
+            ev.libc = _parse_libc(libc_path)
         reach = self._reachable_map()
 
         func_syscalls: dict[int, list] = {}
@@ -511,11 +557,18 @@ class TaintAnalyzer:
                         if unbounded:
                             why = (f"栈缓冲区距 saved-eip {ret_off}(0x{ret_off:x})"
                                    f"字节,可覆盖返回地址")
+                            reentry = None
+                            if _has_stack_realign(body) and ret_off > 8:
+                                reentry = ret_off - 8
+                                why += (f"; 该函数含栈对齐(and esp,-16), "
+                                        f"若通过 ret 二次返回本函数再溢出, "
+                                        f"偏移可能为 {reentry}")
                             ev.overflow.append(OverflowSite(
                                 func=name, faddr=addr, site=ce.site, call=callee_name,
                                 args=[self._fmt_expr(a) for a in args],
                                 base="", disp=0, offset_to_ret=ret_off,
-                                why=why, reachable=addr in reach))
+                                why=why, reachable=addr in reach,
+                                reentry_offset=reentry))
                             if addr not in reach:
                                 ev.unreachable.append({"name": name, "addr": addr})
                             continue
@@ -571,10 +624,27 @@ def _dedup_backdoor(items) -> list:
     return [best[k] for k in sorted(best)]
 
 def _gadget_cat(asm: str) -> str:
-    if asm == "int 0x80":
+    """按 gadget 用途归类: reg-set / stack-pivot / syscall / call / move / arith / other."""
+    if asm in ("int 0x80", "syscall"):
         return "syscall"
-    if asm.startswith("pop"):
+    insns = [s.strip() for s in asm.split(";") if s.strip()]
+    if not insns:
+        return "other"
+    mnems = [i.split()[0] for i in insns
+             if i.split()[0] not in ("ret", "retf")]
+    if not mnems:
+        return "other"
+    if any(m == "leave" or m.startswith("xchg") for m in mnems):
+        return "stack-pivot"
+    if all(m == "pop" for m in mnems):
         return "reg-set"
+    if any(m == "call" for m in mnems):
+        return "call"
+    if any(m == "mov" for m in mnems):
+        return "move"
+    if any(m in ("add", "sub", "xor", "and", "or", "neg", "not",
+                 "shl", "shr", "sar", "inc", "dec") for m in mnems):
+        return "arith"
     return "other"
 
 def is_large_static(prog, binary_path: str | None, text_limit: int = 0x40000) -> bool:
@@ -601,6 +671,70 @@ def is_large_static(prog, binary_path: str | None, text_limit: int = 0x40000) ->
             return dynsym is None and text_big
     except Exception:
         return False
+
+def _find_libc(binary_path: str | None) -> str | None:
+    """在二进制同目录寻找 libc(libc.so* / libc-*.so)。"""
+    if not binary_path:
+        return None
+    d = os.path.dirname(os.path.abspath(binary_path))
+    try:
+        names = sorted(os.listdir(d))
+    except Exception:
+        return None
+    for fn in names:
+        if re.match(r"^libc[\.-]", fn) or fn.startswith("libc.so"):
+            p = os.path.join(d, fn)
+            if not os.path.isfile(p):
+                continue
+            try:
+                with open(p, "rb") as f:
+                    if f.read(4) == b"\x7fELF":
+                        return p
+            except Exception:
+                continue
+    return None
+
+def _parse_libc(path: str) -> dict:
+    """解析 libc 中 system/puts/__libc_start_main 等符号偏移与 /bin/sh 地址。"""
+    info: dict = {"path": path}
+    try:
+        from elftools.elf.elffile import ELFFile
+        with open(path, "rb") as f:
+            elf = ELFFile(f)
+            want = {"system", "__libc_start_main", "puts", "read", "write",
+                    "execve", "printf"}
+            dynsym = elf.get_section_by_name(".dynsym")
+            symtab = elf.get_section_by_name(".symtab")
+            for tab in (dynsym, symtab):
+                if tab is None:
+                    continue
+                for sym in tab.iter_symbols():
+                    if sym.name in want and sym.entry.st_value and sym.name not in info:
+                        info[sym.name] = sym.entry.st_value
+            for s in elf.iter_sections():
+                if s.name not in (".rodata", ".data"):
+                    continue
+                i = s.data().find(b"/bin/sh\x00")
+                if i >= 0:
+                    info["str_bin_sh"] = s.header.sh_addr + i
+                    break
+    except Exception as e:
+        info["error"] = str(e)
+    return info
+
+def _has_stack_realign(body) -> bool:
+    """判断函数序言是否含栈对齐(and esp/rsp, -16).
+
+    这类函数若通过 ret 二次返回再触发溢出, 栈基址可能平移, 导致
+    buffer->saved-eip 距离与首次不同(常见 8 字节差)。
+    """
+    for ins in body or []:
+        if ins.mnemonic != "and":
+            continue
+        op = ins.op_str.replace(" ", "").lower()
+        if op in ("esp,0xfffffff0", "esp,-16", "rsp,0xfffffff0", "rsp,-16"):
+            return True
+    return False
 
 def detect_protections(prog, binary_path: str | None) -> dict:
     out = {"PIE": "unknown", "NX": "unknown", "RELRO": "unknown", "Canary": "off"}
