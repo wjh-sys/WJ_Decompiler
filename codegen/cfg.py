@@ -59,6 +59,7 @@ class Structurer:
         self.lines: list[str] = []
         self._build_preds()
         self._prep_returns()
+        self.redirect = self._prep_redirect()
 
     def structurize(self) -> list[str]:
         self._region(0, len(self.order), 0)
@@ -107,6 +108,22 @@ class Structurer:
     def _ret_stmt(self, start: int) -> str:
         return self.gen._fmt_ret(self.blocks[start].insts[-1])
 
+    def _prep_redirect(self) -> dict:
+        """纯无条件跳转块(块体为空, 仅一条 jmp)可被穿透: 把指向它的跳转
+        直接改指其目标, 从而消除仅剩空标签的块。"""
+        red = {}
+        for s, b in self.blocks.items():
+            if len(b.insts) == 1 and b.insts[0].op == Op.BRANCH and b.insts[0].cond is None:
+                red[s] = b.insts[0].target
+        return red
+
+    def _resolve(self, target):
+        seen = set()
+        while target in self.redirect and target not in seen:
+            seen.add(target)
+            target = self.redirect[target]
+        return target
+
     def _ind(self, depth: int) -> str:
         return _INDENT * (depth + 1)
 
@@ -144,6 +161,7 @@ class Structurer:
     def _emit_goto(self, target, depth: int) -> None:
         if target is None:
             return
+        target = self._resolve(target)
         ind = self._ind(depth)
         if target in self.inline_ret:
             self._push_line(f"{ind}{self._ret_stmt(target)}")
@@ -156,6 +174,7 @@ class Structurer:
         """无法折叠为 if/while 的条件分支: 保留为跳转, 不丢失控制流."""
         ind = self._ind(depth)
         cond = self.gen._fmt_cond(expr)
+        target = self._resolve(target)
         if target in self.inline_ret:
             self._push_line(f"{ind}if ({cond}) {self._ret_stmt(target)}")
             return
@@ -205,7 +224,7 @@ class Structurer:
 
     def _emit_cond(self, blk, i: int, stop: int, depth: int) -> int:
         term = blk.term
-        ti = self.index.get(term.target)
+        ti = self.index.get(self._resolve(term.target))
         fi = i + 1
         if ti is not None and ti == fi:
             self._emit_block(blk.start, depth)
@@ -214,6 +233,16 @@ class Structurer:
             self._emit_block(blk.start, depth)
             self.lines.append(f"{self._ind(depth)}if ({self._cond_str(term.cond, negate=True)}) {{")
             self._region(fi, ti, depth + 1)
+            self.lines.append(f"{self._ind(depth)}}}")
+            return ti
+        if (ti == fi + 1 and self._ret_fall(fi, ti)
+                and self.preds.get(self.order[fi], set()) == {blk.start}):
+            # early-return: 条件不成立时落空到 return 块 -> 折叠为 if(!cond){return ...}
+            self._emit_block(blk.start, depth)
+            self.lines.append(f"{self._ind(depth)}if ({self._cond_str(term.cond, negate=True)}) {{")
+            fb = self.blocks[self.order[fi]]
+            self.emitted.add(fb.start)
+            self._emit_insts(fb.insts, depth + 1)
             self.lines.append(f"{self._ind(depth)}}}")
             return ti
         x = fi
@@ -236,6 +265,13 @@ class Structurer:
         self._emit_block(blk.start, depth)
         self._emit_cond_goto(term.cond, term.target, depth)
         return i + 1
+
+    def _ret_fall(self, lo: int, hi: int) -> bool:
+        """区间 [lo, hi) 恰为一个以 RET 结尾的块(early-return 落空块)."""
+        if hi != lo + 1:
+            return False
+        t = self.blocks[self.order[lo]].term
+        return t is not None and t.op == Op.RET
 
     def _straight(self, lo: int, hi: int) -> bool:
         if lo >= hi:

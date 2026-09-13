@@ -6,6 +6,8 @@ from ir.naming import recover, rename_registers
 from .cfg import Structurer
 
 _RET_SIZE = 32
+_FRAME_REGS = {"esp", "ebp", "rsp", "rbp"}
+_FRAME_DISPLAY = {"esp": "sp", "rsp": "sp", "ebp": "fp", "rbp": "fp"}
 
 class CGenerator:
     def __init__(self, prog=None) -> None:
@@ -19,11 +21,16 @@ class CGenerator:
     def generate(self, insts: list[IRInst]) -> str:
         insts = self._suppress_stack_args(insts)
         insts, vinfo = recover(insts, self._prog)
-        rename_registers(insts)
+        regmap = rename_registers(insts)
         body: list[str] = []
         if vinfo is not None and vinfo.types:
             decls = "; ".join(self._decl(n, t) for n, t in sorted(vinfo.types.items()))
             body.append(f"    // 恢复变量: {decls}")
+        if regmap:
+            items = " ".join(f"{k}={v}" for k, v in regmap.items())
+            body.append(f"    // 寄存器映射: {items}")
+            body.append("    // 注: 未编号的寄存器名(eax/edx 等)为跨块合并点取值; "
+                        "sp/fp 分别表示栈指针/帧指针")
         body += Structurer(insts, self).structurize()
         return "\n".join(body)
 
@@ -60,6 +67,10 @@ class CGenerator:
             if self._is_epilogue_block(inst, nxt):
                 lines.append("// 尾声")
                 i += 2
+                continue
+            if self._is_frame_write(inst):
+                # 栈帧管理(建叉/销毁/leave/清帧): 对 esp/ebp 的赋值无 C 语义, 抑制
+                i += 1
                 continue
             ln = self._fmt_inst(inst)
             if ln is not None:
@@ -106,6 +117,11 @@ class CGenerator:
         ok0 = isinstance(a.dst, Var) and a.dst.name == "esp" and isinstance(a.src, Var) and a.src.name == "ebp"
         ok1 = isinstance(b.dst, Var) and b.dst.name == "ebp"
         return ok0 and ok1
+
+    def _is_frame_write(self, inst: IRInst) -> bool:
+        """是否为对栈帧指针(esp/ebp)的赋值(纯帧管理, 输出时抑制)."""
+        return (inst.op == Op.ASSIGN and isinstance(inst.dst, Var)
+                and inst.dst.name in _FRAME_REGS)
 
     def _fmt_assign(self, inst: IRInst) -> str:
         dst = self._fmt_expr(inst.dst)
@@ -166,7 +182,7 @@ class CGenerator:
 
     def _fmt_expr(self, expr: Expr) -> str:
         if isinstance(expr, Var):
-            return expr.name
+            return _FRAME_DISPLAY.get(expr.name, expr.name)
         if isinstance(expr, Const):
             s = self._fmt_str(expr.val)
             if s is not None:

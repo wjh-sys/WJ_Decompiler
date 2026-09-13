@@ -146,6 +146,19 @@ python wjdump.py -d -M att <binary>
 对应的 objdump 选项：`-f -h -d -D -s -t -j --start-address --stop-address -M`；`-C` 为伪代码生成扩展选项。
 当前仅支持 ELF（x86/x86-64/arm/aarch64）。
 
+**与 objdump 的对齐**（第三版逐个通道对标，同一二进制左右对照可逐字符一致）：
+
+| 选项 | 已对齐内容 |
+|---|---|
+| `-f` | `file format` 行、`architecture: …, flags 0x…:` 与标志名行(EXEC_P/HAS_SYMS/D_PAGED…)、`start address` 按位宽补零 |
+| `-h` | 列宽/表头精确对齐、`Idx` 跳过 NULL 后从 0 编号、属性行缩进、`-j` 指定节区时索引不变 |
+| `-s` | 每 4 字节一组、16 字节一行、十六进制列定宽、文件头行、节区间不空行、支持 `--start/--stop-address` |
+| `-t` | 直读 `.symtab` 全量符号、7 字符 flags(`l    d`/`l     F`/`l    df`)、`*UND*` 全局符号不印绑定字母、`.hidden/.internal` 可见性前缀 |
+| `-d`/`-D` | 文件头行、函数标签与节区符号(`<.plt>`)、跳转目标标注(含 `<_init+0x1e>` 函数内偏移)、超 7 字节指令换行续排、**连续零字节折叠为 `...`** |
+| 选项 | `-j` 同时支持 `-d/-D/-h/-s`；`-j` 节区不存在时告警；`-M intel/att` |
+
+> **语法取舍**：默认 **Intel** 语法（`-M att` 可切 AT&T）。故操作数书写与 objdump 的 AT&T 默认不同（如 `sub esp, 8` vs `sub $0x8,%esp`、`66 90` 显示为 `nop` 而非 `xchg %ax,%ax`），属显式取舍，非排版差异。
+
 ### 自动验证生成的 EXP（verify_exp）
 
 `verify_exp.py` 读取 `analyze.py --json-out` 导出的报告，沙箱提取 `exploit_plan.exp_code`
@@ -290,17 +303,14 @@ CLI 入口:
 
 
 ## 已知限制
-- python wjdump后展示的代码字符结构不够美观，second edition着重强调将工具系统化正规化
-
-- 仅支持 ELF（x86/x86-64/arm/aarch64），不支持 PE
---> 这个是第四版需要解决的问题，着重于拓展分析程序边界
-
+- **功能分散** → 后期专注于将功能整合到一个模块中，避免功能分散，且会将refine.py合并到analyze.py中
 - **栈溢出能力** → **第二版已实现，但解题率有限**：已建立 11 题评测基线，**漏洞识别/偏移定位 9/11、技术路线同官方 9/11**，但**端到端 PASS 仅 1/11**；公共卡点为 `stage_runtime`（多阶段交互时序） -->后期再进行优化，先不管
 - **堆溢出 / 格式化字符串 / 整数溢出 / ROP 链高级技巧（ret2dlresolve、SROP、BROP、栈迁移）** → **第二版未覆盖**，当前分析聚焦栈溢出 -->主要是算法的更新以及功能的完善
 - **全静态大体积二进制** → 仍被 `is_large_static` 跳过（无 PLT 符号可识别 source）
+- 仅支持 ELF（x86/x86-64/arm/aarch64），不支持 PE --> 这个是第四版需要解决的问题，着重于拓展分析程序边界
 
 ## 下一步规划
-- [ ] 对于python wjdump后的每一个通道字功能（如-s，-c，etc）都一个一个实验，一个一个修改即可
+- [ ] 功能整合：将 analyze.py 中的代码合并到一个模块中，避免功能分散，且会将 refine.py 合并到 analyze.py 中
 - [ ] **提升端到端解题率（最高优先）**：评测显示 `stage_runtime`（多阶段交互时序）在 11 题中全部命中，优先加固泄漏读取与交互建模
 - [ ] 扩展 pwn 覆盖面：堆溢出 / 格式化字符串 / 整数溢出分析（第二版仅覆盖栈溢出）
 - [ ] 新增「与官方 exp 相似度」指标（当前完成度衡量打通度，未直接反映与官方的接近程度）

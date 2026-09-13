@@ -33,6 +33,16 @@ def build_prog_info(prog: Program) -> str:
     return "\n".join([
         "[程序信息]",
         f"架构: {prog.arch}   位数: {prog.bits}   入口: 0x{prog.entry:x}",
+        "",
+        "[伪代码命名约定]",
+        "- vN: 寄存器版本变量(同一寄存器每次赋值生成新版本), 映射见各函数行首"
+        " `// 寄存器映射: v1=eax#1 ...`; 未编号的 eax/edx 等为跨块合并点取值",
+        "- sp / fp: 分别表示栈指针 / 帧指针(即 esp / ebp)",
+        "- var_xx / arg_n / stk_xx: 栈槽(局部变量 / 栈传参 / 按 esp 计偏移的栈槽); "
+        "`char name[N]` 为被写入的栈缓冲区",
+        "- 未实现的间接跳转会保留为 `// 尾调用 -> ...` 或 `(*reg)(...)` 注释",
+        "- 占位提示: `char xxx[N]` 的 N 为按栈槽间距估算的启发式大小, "
+        "**溢出偏移必须以[静态污点证据]中的实测 offset 为准**, 不要用 N 自行推算",
     ])
 
 def build_graph_text(graph, nodes) -> str:

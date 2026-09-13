@@ -230,13 +230,15 @@ def _sub_reg(e, cur: dict):
 def rename_registers(insts):
     """寄存器版本化重命名(基本块内 SSA 式线性编号).
 
-    单个基本块内每次定义通用寄存器生成新版本名(eax→eax_1/eax_2...),
-    后续使用引用最近的版本; 跨块边界(含跳转目标)重置映射, 使跨块使用的
-    寄存器保留原名(不臆造版本), 从而避免多前驱合并点上的错误命名。
+    单个基本块内每次定义通用寄存器生成中性变量名(v1/v2/...), 后续使用引用
+    最近的版本; 跨块边界(含跳转目标)重置映射, 使跨块使用的寄存器保留原名
+    (不臆造版本), 从而避免多前驱合并点上的错误命名。
     栈指针(esp/ebp/rsp/rbp)不重命名, 以保留栈帧语义与序言/尾声折叠。
+    返回 {变量名: 寄存器#序号} 映射(供输出注释追溯来源)。
     """
+    regmap: dict = {}
     if not insts:
-        return insts
+        return regmap
     leaders = {insts[0].addr}
     for idx, inst in enumerate(insts):
         if inst.op in (Op.BRANCH, Op.RET) and idx + 1 < len(insts):
@@ -245,6 +247,7 @@ def rename_registers(insts):
             leaders.add(inst.target)
     cur: dict = {}
     count: dict = {}
+    seq = 0
     last = None
     for inst in insts:
         a = inst.addr
@@ -264,8 +267,11 @@ def rename_registers(insts):
         if isinstance(inst.dst, Var) and inst.dst.name in _GPR:
             reg = inst.dst.name
             count[reg] = count.get(reg, 0) + 1
-            cur[reg] = f"{reg}_{count[reg]}"
-            inst.dst = Var(cur[reg], inst.dst.size)
+            seq += 1
+            name = f"v{seq}"
+            cur[reg] = name
+            regmap[name] = f"{reg}#{count[reg]}"
+            inst.dst = Var(name, inst.dst.size)
         else:
             inst.dst = _sub_reg(inst.dst, cur)
-    return insts
+    return regmap
