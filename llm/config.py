@@ -24,10 +24,16 @@ def load_config() -> LLMConfig:
     if not key:
         raise LLMConfigError(
             "未找到 LLM_API_KEY 环境变量。\n"
-            "请先配置环境变量再运行，例如(Windows CMD):\n"
-            "  set LLM_API_KEY=sk-xxxx\n"
-            "  set LLM_BASE_URL=https://api.deepseek.com\n"
-            "  set LLM_MODEL=deepseek-chat"
+            "请先配置环境变量再运行，例如:\n"
+            "  Windows CMD:\n"
+            "    set LLM_API_KEY=sk-xxxx\n"
+            "    set LLM_BASE_URL=https://api.deepseek.com\n"
+            "    set LLM_MODEL=deepseek-chat\n"
+            "  Linux / WSL (bash):\n"
+            "    export LLM_API_KEY=sk-xxxx\n"
+            "    export LLM_BASE_URL=https://api.deepseek.com\n"
+            "    export LLM_MODEL=deepseek-chat\n"
+            "  注意: 在 WSL 中 set 无效, 必须用 export; 可用 echo ${LLM_API_KEY:0:6} 验证"
         )
     return LLMConfig(
         base_url=os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL).strip(),

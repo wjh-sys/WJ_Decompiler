@@ -16,6 +16,7 @@ from .base import BaseLoader, Program, Section, Symbol
 
 SHF_WRITE = 0x01
 SHF_EXECINSTR = 0x04
+PF_X = 0x1
 
 class ElfLoader(BaseLoader):
     def load(self) -> Program:
@@ -50,13 +51,23 @@ class ElfLoader(BaseLoader):
         for seg in elf.iter_segments():
             if seg.header.p_type == "PT_LOAD":
                 load_ranges.append((seg.header.p_vaddr,
-                                    seg.header.p_vaddr + seg.header.p_memsz))
+                                    seg.header.p_vaddr + seg.header.p_memsz,
+                                    bool(seg.header.p_flags & PF_X)))
 
         def _loaded(addr: int, size: int) -> bool:
             if not size:
                 return False
             return any(a <= addr < b or (a < addr + size and addr < b)
-                       for a, b in load_ranges)
+                       for a, b, _ in load_ranges)
+
+        def _seg_exec(addr: int, size: int) -> bool:
+            # 段级可执行性: 节的 sh_flags 与所在 PT_LOAD 的 p_flags 可能不一致
+            # (如 .bss 常为 sh_flags=WA 而所在段 p_flags=RWE), 而运行时权限由段决定.
+            # 只看节会误判"不可执行", 使模型主动排除正确解法(如跳全局缓冲执行 shellcode).
+            if not size:
+                return False
+            return any(x and (a <= addr < b or (a < addr + size and addr < b))
+                       for a, b, x in load_ranges)
 
         sections = []
         for s in elf.iter_sections():
@@ -79,6 +90,7 @@ class ElfLoader(BaseLoader):
                 file_off=s.header.sh_offset,
                 flags=s.header.sh_flags,
                 loaded=_loaded(s.header.sh_addr, s.header.sh_size),
+                seg_exec=_seg_exec(s.header.sh_addr, s.header.sh_size),
             ))
         return sections
         
@@ -87,7 +99,11 @@ class ElfLoader(BaseLoader):
         for s in elf.iter_sections():
             if isinstance(s, SymbolTableSection):
                 for sym in s.iter_symbols():
-                    if sym.entry.st_info.type == "STT_FUNC" and sym.entry.st_value:
+                    # 同时收集 STT_OBJECT(如全局缓冲 buf2): 缺了它, 这类地址只能退化为
+                    # sub_XXXX 伪名(sub_ 前缀暗示函数), 会被误认为代码地址.
+                    # 消费者均以 s.is_func 或节区归属过滤, 故加入对象符号不影响函数发现.
+                    if sym.entry.st_info.type in ("STT_FUNC", "STT_OBJECT") \
+                            and sym.entry.st_value:
                         # 反查符号所在节区名
                         sec_name = ""
                         try:
@@ -101,7 +117,7 @@ class ElfLoader(BaseLoader):
                         symbols.append(Symbol(
                             name=sym.name,
                             addr=sym.entry.st_value,
-                            is_func=True,
+                            is_func=(sym.entry.st_info.type == "STT_FUNC"),
                             sym_type=sym.entry.st_info.type,
                             bind=sym.entry.st_info.bind,
                             section=sec_name,

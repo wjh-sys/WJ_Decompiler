@@ -13,7 +13,10 @@
 - **objdump 风格 CLI（wjdump）**：`-f/-h/-d/-D/-s/-t/-C/-j/--start-address/--stop-address/-M`，带 `<name@plt>` 符号标注，排版对齐 objdump；`-C` 生成函数 C 伪代码(调用点还原真实符号名)
 - **静态污点证据**：source(gets/read)→栈溢出点、溢出偏移实测(含 ret 二次进入的栈对齐平移)、后门/ROP gadget 扫描(签名+滑窗双通道)、同目录 libc 符号偏移，喂给 LLM 生成可直接运行的 EXP
 - **LLM 漏洞分析**：反编译产物 + 调用图展开组装 Prompt，接入大模型产出结构化 CTF 漏洞报告
-- **Taint 引导的迭代 EXP 精炼闭环（Algorithm 1）**：`refine.py` 落地 生成 EXP → 真实验证 → 归因 → 反查静态语料补全 Taint → 重出报告，含 8 个终止条件与锁定字段回填(防漂移)
+- **统一入口 analyze.py**：单文件内含「基础设施 + Algorithm 2 评分 + Algorithm 1 闭环」；`<bin>` 单轮分析、`--refine` 迭代精炼
+- **Taint 引导的迭代 EXP 精炼闭环（Algorithm 1）**：`analyze.py --refine` 落地 生成 EXP → 真实验证 → 归因 → 反查静态语料补全 Taint → 重出报告，含 8 个终止条件与锁定字段回填(防漂移)
+- **EXP 完成度评分与收敛策略（Algorithm 2）**：`score_exp` 四维加权(运行时/静态/语义/覆盖) + PASS 短路 + 单调包络 + 双阈值滞回；可测性与证据双重门控
+- **List Table 与利用方向库**：十类证据归一为统一索引，`lookup` 四态反查；13 条经典栈溢出路线按证据判定可行性并给出首选方向
 - **终端可视化**：每轮规范化展示验证反馈、大模型归因、缺口诊断(偏移/ gadget 核对)、反查材料与迭代时间线
 - **可交付 EXP**：输出完成度评分 + 缺口清单(阻塞/待改) + LLM 构造原理讲解与待人工补充步骤，即便环境不匹配也能给出可改写的完整 EXP
 - **自动化评测**：`test_py/run_stackoverflow_batch.py` 批量跑题并与官方 exp 对照(偏移/技术/端到端 PASS)
@@ -45,9 +48,9 @@ python analyze.py <binary> 0x8048648 --depth 3 --max-nodes 20
 
 输出为结构化漏洞报告（漏洞类型、调用链、危险点、利用思路等），详见 `llm/schema.py`。
 
-### Algorithm 1：Taint 引导的迭代 EXP 精炼闭环（refine.py）
+### Algorithm 1：Taint 引导的迭代 EXP 精炼闭环（analyze.py --refine）
 
-`refine.py` 落地 `algorithm/Algorithm_1.py` 的完整闭环：
+`analyze.py --refine` 落地 `algorithm/Algorithm_1.py` 的完整闭环：
 **生成 EXP → 真实验证 → 归因 → 反查静态语料补全 Taint → 重出报告**。
 每轮把大模型反馈、归因思考、缺口诊断（偏移是否算对 / gadget 是否够用）规范化可视化到终端。
 
@@ -65,19 +68,72 @@ export LLM_BASE_URL=https://api.deepseek.com
 export LLM_MODEL=deepseek-chat
 
 # 运行闭环: --rounds N 最大轮数, --theta 完成度收敛阈值
-python3 refine.py <binary> --rounds 3 --theta 0.95
+python3 analyze.py <binary> --refine --rounds 3 --theta 0.95
 
 # 带 flag 探测 / 导出最终报告 / 单色输出
-python3 refine.py <binary> --flag flag --json-out ret2text_final.json
-python3 refine.py <binary> --no-color
+python3 analyze.py <binary> --refine --flag flag --json-out ret2text_final.json
+python3 analyze.py <binary> --refine --no-color
 ```
 
 终止状态: `PASS` / `PASS_SUSPECT` / `CONVERGED` / `NO_PROBLEM` / `STALLED` / `UNRESOLVABLE` / `LLM_FAILED` / `MAX_ROUNDS`。
 
+### Algorithm 2：EXP 完成度评分与收敛策略（analyze.py 内）
+
+落地 `algorithm/Algorithm_2.py` 的设计，作为**唯一评分入口**（`score_exp`），
+消除「轮内一个尺、交付另一个尺」的量纲不一致。
+
+**信度分层（高→低）**：
+
+| 维度 | 权重 | 依据 |
+|---|---|---|
+| `run` 运行时 | 0.40 | `verify_exp` 阶段分（`marker_ok`…`no_exp_code`），真机可复现 |
+| `static` 静态结构化 | 0.30 | 偏移命中实测值(0.5) + 路线成立(0.3) + 无阻塞项(0.2) |
+| `llm` 语义评分 | 0.15 | LLM 自评 × 置信度折扣 × EMA 平滑（**必须引用证据**） |
+| `cov` 工具覆盖 | 0.15 | 问题经 List Table 反查的命中率(HIT/DERIVED/SECTION/MISS) |
+
+**四条不变量**：
+
+1. **PASS 短路**：`F.ok` 直接 1.0，不参与加权折中（真打通不会被主观分拉低）
+2. **非 PASS 不越阈**：权重设计使未打通时 `raw ≤ 0.82 < θ=0.95`
+3. **单调包络**：`Score_k = max(Score_{k-1}, raw_k)`，跨轮只升不降，保证可比
+4. **双阈值滞回**：收敛需连续 2 轮 `raw ≥ 0.85`，并诊断 `REGRESSION` / `STALLED`
+
+**两个关键语义**：
+
+- **可测性门控**：静态证据测不出偏移时(如手工循环读缓冲)，该维度**移出加权并重新归一化**，
+  而非计 0 分——避免把工具盲区记到 EXP 账上（`breakdown.excluded` 可追溯）
+- **证据门控**：LLM 的评分与问题都必须引用证据（`evidence` 字段）。
+  **无据的评分不计分、无据的问题不扣分**（正负双向对称，防「无据刷分」与「假 blocker」）
+
+### List Table 与利用方向库
+
+- **统一行模型**（`analysis/listtable.py`）：把 taint 的十类证据归一为 `ToolEntry`，
+  以 `类别:名字` 为键建索引，提供 `lookup(kind, target)` 四态反查：
+  `HIT`(精确命中) / `DERIVED`(可推导) / `SECTION`(分区存在) / `MISS`(无分区)，
+  评分映射 1.0 / 0.7 / 0.5 / 0.0。**单一数据源**同时服务 prompt 渲染、`resolver` 反查与覆盖度评分
+- **利用方向库**（`analysis/techniques.py`）：13 条经典栈溢出路线
+  （ret2text / ret2shellcode / ret2libc / ret2libc-leak / ret2csu / ret2syscall / srop /
+  ret2dlresolve / ret2rop / stack-pivot / format-leak / canary-bypass / partial-overwrite）
+  以 `requires` 声明前置能力(如 `exec:system`、`gadget:pop rdi`、`prot:nx_off`、`arch:bits64`)，
+  可行性由 List Table **客观判定**为 `AVAILABLE` / `PARTIAL` / `BLOCKED`，并按策略优先级 `rank` 排序，
+  在 prompt 中为首选路线标 `★首选`，引导模型不再只想到 `system@plt` + `/bin/sh`
+
+### 离线校准（test_py/calibrate_weights.py）
+
+以题库 11 道题的**官方 exp** 为 ground truth，纯静态校验（不需 LLM/网络）：
+
+```bash
+python3 test_py/calibrate_weights.py --verbose
+```
+
+当前结果：`偏移实测 10/11 | 路线反推 11/11 | 模型覆盖 10/11`；
+11 道官方正解得分**全部为 0.820**（非 PASS 上限），证明权重自洽、
+分数只反映 EXP 质量而不混杂工具识别率（未测出的 1 题标记为「证据缺失故不可判定」）。
+
 ### 栈溢出题库评测（第二版基线）
 
 `test_py/run_stackoverflow_batch.py` 对题库中**可测的栈溢出题目**（动态链接 ELF + x86/x86-64）
-批量跑 `refine.py`，并与**题目自带官方 exp** 对照（偏移 / 技术路线 / 端到端 PASS）。
+批量跑 `analyze.py --refine`，并与**题目自带官方 exp** 对照（偏移 / 技术路线 / 端到端 PASS）。
 
 ```bash
 python3 test_py/run_stackoverflow_batch.py --tier 1 --rounds 2   # 32 位 8 题
@@ -89,33 +145,54 @@ python3 test_py/run_stackoverflow_batch.py --only ret2libc1      # 单题
 
 | 题目 | 状态 | 完成度 | 工具偏移 | 官方偏移 | 偏移 | 技术 | gaps |
 |---|---|---|---|---|---|---|---|
-| ret2text | MAX_ROUNDS | 42.5% | 0x70 | 0x70 | ✔ | ✔ | 4 |
-| stack_example | MAX_ROUNDS | 45.0% | 0x18 | 0x18 | ✔ | ✔ | 4 |
+| **ret2text** | **PASS** | **100%** | 0x70 | 0x70 | ✔ | ✘ | 0 |
+| stack_example | STALLED | 55.5% | 0x18 | 0x18 | ✔ | ✔ | 4 |
 | **ret2libc1** | **PASS** | **100%** | 0x70 | 0x70 | ✔ | ✔ | 0 |
-| ret2libc2 | MAX_ROUNDS | 17.5% | 0x70 | 0x70 | ✔ | ✘ | 3 |
-| ret2libc3 | MAX_ROUNDS | 37.5% | 0x70 | 0x70 | ✔ | ✔ | 3 |
-| ret2shellcode | MAX_ROUNDS | 40.0% | 0x70 | 0x70 | ✔ | ✔ | 4 |
-| train_ret2libc | MAX_ROUNDS | 37.5% | - | 0x20 | ✘ | ✔ | 4 |
-| ropasaurusrex | MAX_ROUNDS | 37.5% | 0x8c | 0x8c | ✔ | ✔ | 4 |
+| ret2libc2 | MAX_ROUNDS | 54.1% | 0x70 | 0x70 | ✔ | ✔ | 3 |
+| ret2libc3 | MAX_ROUNDS | 58.9% | 0x70 | 0x70 | ✔ | ✔ | 3 |
+| ret2shellcode | MAX_ROUNDS | 55.5% | 0x70 | 0x70 | ✔ | ✘ | 5 |
+| train_ret2libc | MAX_ROUNDS | 59.2% | 0x20 | 0x20 | ✔ | ✔ | 4 |
+| ropasaurusrex | MAX_ROUNDS | 59.9% | 0x8c | 0x8c | ✔ | ✔ | 3 |
 
-`PASS 1/8 | 偏移符合 7/8 | 技术符合 7/8 | 平均完成度 44.7%`
+`PASS 2/8 | 偏移符合 8/8 | 技术符合 6/8 | 平均完成度 67.9%`
 
 **64 位（第二梯队，3 题）**
 
 | 题目 | 状态 | 完成度 | 工具偏移 | 官方偏移 | 偏移 | 技术 | gaps |
 |---|---|---|---|---|---|---|---|
-| shellcode_x64 | MAX_ROUNDS | 32.5% | 0x18 | 0x18 | ✔ | ✔ | 4 |
-| hitcon_level5 | MAX_ROUNDS | 35.0% | 0x88 | 0x88 | ✔ | ✔ | 1 |
-| r0pbaby | MAX_ROUNDS | 5.0% | - | 0x8 | ✘ | ✘ | 7 |
+| shellcode_x64 | STALLED | 52.1% | 0x18 | 0x18 | ✔ | ✔ | 4 |
+| hitcon_level5 | MAX_ROUNDS | 56.3% | 0x88 | 0x88 | ✔ | ✔ | 3 |
+| r0pbaby | MAX_ROUNDS | 16.1% | - | 0x8 | ✘ | ✘ | 7 |
 
-`PASS 0/3 | 偏移符合 2/3 | 技术符合 2/3 | 平均完成度 24.2%`
+`PASS 0/3 | 偏移符合 2/3 | 技术符合 2/3 | 平均完成度 41.5%`
 
-> **结论（11 题合计）**：端到端 `PASS 1/11`；但**漏洞识别与溢出偏移定位**达 `9/11`，
-> **技术路线与官方同构**达 `9/11`。即：工具能找准漏洞与偏移，瓶颈在**多阶段交互的运行时细节**
+> **结论（11 题合计）**：端到端 `PASS 2/11`；**漏洞识别与溢出偏移定位**达 `10/11`，
+> **技术路线与官方同构**达 `8/11`。瓶颈仍是**多阶段交互的运行时细节**
 > （`stage_runtime` 在 11 题中全部命中，为首要卡点）。
 
-> **指标口径**：`完成度` 为「端到端打通度」（0.5×验证阶段 + 0.5×LLM 归因），未 PASS 天然封顶 ~55%，
-> 故 37.5%~45% 表示「流程跑通但未拿到 shell」，**不代表 EXP 质量差**；同一题重复运行因 LLM 非确定性可能小幅波动。
+> **指标口径（Algorithm 2）**：`完成度` = 四维加权（运行时 0.40 / 静态 0.30 / 语义 0.15 / 覆盖 0.15），
+> 未 PASS 天然封顶 `0.82`（= `0.40×0.55 + 0.30 + 0.15 + 0.15`），故 52%~60% 表示
+> 「流程跑通但未拿到 shell」，**不代表 EXP 质量差**；重复运行因 LLM 非确定性可能小幅波动。
+> `技术` 列以**官方路线**为基准：`ret2text` 实际是模型用另一条合法路线（system@plt 直调）打通（真机 PASS）而判 ✘。
+> 上表为**修复前**批量跑的结果；其中 `ret2shellcode` 的 ✘ 源于当时交付物被空 EXP 覆盖（`no_exp_code`），
+> 现已由「交付物单调性」修复解决（详见下节），该题路线反推已恢复正确为 `ret2shellcode`。
+
+
+### 静态证据能力补强（近期修复）
+
+针对 `ret2shellcode` 类题型的排查，补齐了四处**通用**证据能力；均已通过离线校准回归
+（官方正解仍同为 0.820，未破坏评分体系）：
+
+| 修复 | 内容 | 通用收益 |
+|---|---|---|
+| 全局落地缓冲 | 识别 `strcpy/strncpy/memcpy/memmove` 等拷贝**到 `.data/.bss` 固定地址**的目标，产出 `global_buf` 可利用目标（如 `buf2 @ 0x804a080`） | 一切"输入被拷入全局缓冲"的题型；避免模型去猜不可知的栈地址 |
+| 对象符号采集 | 符号表同时收集 `STT_OBJECT`（此前仅 `STT_FUNC`） | 全局变量/缓冲显示真名(`buf2`)而非伪名(`sub_804a080`) |
+| 可执行性判定 | 新增段级 `PT_LOAD` 的 `p_flags` 采集(`Section.seg_exec`)；配合 `PT_GNU_STACK` 推导的 `NX=off`，判定"可写内存是否可执行" | 代码跳转与栈迁移目标的可行性；此前**仅凭节标志**会把 `.bss` 误判为不可执行，**导致模型主动排除正解** |
+| 交付物单调性 | `J`(EXP 产物) 与 `Score_k`(分数) 对齐：按验证阶段保留历史最优，空 `exp_code` 拒绝覆盖；`score_exp` 的 PASS 短路不再丢失路线信息 | 避免"分数记住峰值、交付的却是更差/空 EXP" |
+
+> **复核**：`ret2shellcode` 修复后，模型已正确定位 `global_buf buf2 @ 0x804a080` 并采用
+> `shellcode.ljust(112,'A') + p32(0x804a080)`（路线反推 `ret2shellcode` 正确）。但真机仍 `segv`，
+> 经排查确认为**运行环境限制**而非工具缺陷（详见已知限制）：三方（官方 exp / 官方解法的 Py3 修正版 / 模型产出）均在同一点失败。
 
 ### objdump 风格命令行工具 wjdump
 
@@ -186,6 +263,8 @@ python3 verify_exp.py ./ret2text reports/ret2text.json
 │   ├── callgraph.py
 │   ├── function_finder.py
 │   ├── taint.py          # 静态污点证据:source/sink/偏移/后门/gadget 扫描
+│   ├── listtable.py      # List Table: 十类证据归一为统一索引 + 四态反查
+│   ├── techniques.py     # 13 条栈溢出技术路线(能力判定 + 策略优先级)
 │   ├── resolver.py       # Resolve: 按问题 kind 反查静态语料(Algorithm 1)
 ├── codegen/    # 伪代码生成
 │   ├── __init__.py
@@ -211,8 +290,8 @@ python3 verify_exp.py ./ret2text reports/ret2text.json
 │   ├── base.py
 │   ├── elf_loader.py
 ├── algorithm/    # 算法(伪代码/设计演示)
-│   ├── Algorithm_1.py    # Taint 优化闭环伪代码
-│   ├── Algorithm_2.py    # 暂定为某优化算法，暂未想好名称
+│   ├── Algorithm_1.py    # Taint 优化闭环伪代码(已落地于 analyze.py --refine)
+│   ├── Algorithm_2.py    # EXP 完成度评分与收敛策略伪代码(已落地于 analyze.py 的 score_exp)
 ├── test/    # 测试样本(CTF pwn 题库)
 │   ├── user-mode/        # stackoverflow / fmtstr / heap / arm / mips / ...
 ├── test_py/    # 实验/调试脚本
@@ -224,8 +303,9 @@ python3 verify_exp.py ./ret2text reports/ret2text.json
 │   ├── demo_decompile_all.py
 │   ├── test_api.py
 │   ├── run_stackoverflow_batch.py  # 栈溢出题库批量评测(对照官方 exp)
-├── analyze.py           # LLM 漏洞分析入口(根目录, 单轮; 内含 round_zero)
-├── refine.py            # Algorithm 1 迭代精炼闭环入口(需在 WSL/Linux 运行)
+│   ├── calibrate_weights.py        # Algorithm 2 离线校准(官方 exp 作基准, 纯静态)
+├── analyze.py           # 统一入口: 单轮分析(默认) / --refine 迭代精炼闭环
+│                        # 内含 round_zero + Algorithm 2(score_exp) + Algorithm 1(refine)
 ├── ui.py                # 终端可视化: 反馈/归因/缺口诊断/迭代时间线
 ├── verify_exp.py        # EXP 自动验证器(需在 WSL/Linux 运行; 含 run_verify)
 ├── reports/             # analyze --json-out 报告输出目录(自动创建)
@@ -286,8 +366,9 @@ python3 verify_exp.py ./ret2text reports/ret2text.json
    结构化漏洞报告（类型 / 调用链 / 危险点 / 利用思路）
 
 CLI 入口:
-  analyze.py <binary> [addr] [--json-out f]   → 完整 LLM 漏洞分析(+报告导出)
-  refine.py <binary> [--rounds N] [--theta t] → Algorithm 1 迭代精炼闭环(需 WSL/Linux)
+  analyze.py <binary> [addr] [--json-out f]             → 单轮 LLM 漏洞分析(+报告导出)
+  analyze.py <binary> --refine [--rounds N --theta t]   → Algorithm 1 闭环(需 WSL/Linux)
+  calibrate_weights.py [--tier all] [--verbose]         → Algorithm 2 离线校准(官方 exp 基准)
   verify_exp.py <binary> <report.json>       → 自动验证 EXP 是否打通(需 WSL/Linux)
   wjdump.py <-f|-h|-d|-D|-s|-t|-C> <binary> → objdump 风格查看/反汇编(-C 生成伪代码)
   run_stackoverflow_batch.py [--tier 1|2|all] → 栈溢出题库批量评测(对照官方 exp)
@@ -303,15 +384,16 @@ CLI 入口:
 
 
 ## 已知限制
-- **功能分散** → 后期专注于将功能整合到一个模块中，避免功能分散，且会将refine.py合并到analyze.py中
-- **栈溢出能力** → **第二版已实现，但解题率有限**：已建立 11 题评测基线，**漏洞识别/偏移定位 9/11、技术路线同官方 9/11**，但**端到端 PASS 仅 1/11**；公共卡点为 `stage_runtime`（多阶段交互时序） -->后期再进行优化，先不管
+- **栈溢出能力** → **第二版已实现，但解题率有限**：已建立 11 题评测基线，**漏洞识别/偏移定位 10/11、技术路线同官方 8/11**，但**端到端 PASS 仅 2/11**；公共卡点为 `stage_runtime`（多阶段交互时序） -->后期再进行优化，先不管
+- **`ret2shellcode` 环境限制（已查明，非工具缺陷）** → 该题正解依赖"NX=off 时 `.bss` 可执行"，即需内核赋予 `READ_IMPLIES_EXEC`（老式 32 位行为）。
+  实测该题在 WSL 上**三方均失败**：官方 `exploit.py`（本身为 **Py2 语法**，`'A'` 应作 `b'A'`，Py3 下直报 `TypeError`）、其 Py3 修正版、以及模型产出（与官方 payload 逐字等价）都在同一点 `segv`。
+  结论：`NX=off` 仅保证**栈**可执行，**不等于 `.bss` 可执行**；现代内核多已收紧该行为。不影响评测口径——批量评测仅从官方 exp **源码文本**反推路线，不依赖其可运行性
 - **堆溢出 / 格式化字符串 / 整数溢出 / ROP 链高级技巧（ret2dlresolve、SROP、BROP、栈迁移）** → **第二版未覆盖**，当前分析聚焦栈溢出 -->主要是算法的更新以及功能的完善
 - **全静态大体积二进制** → 仍被 `is_large_static` 跳过（无 PLT 符号可识别 source）
 - 仅支持 ELF（x86/x86-64/arm/aarch64），不支持 PE --> 这个是第四版需要解决的问题，着重于拓展分析程序边界
 
 ## 下一步规划
-- [ ] 功能整合：将 analyze.py 中的代码合并到一个模块中，避免功能分散，且会将 refine.py 合并到 analyze.py 中
 - [ ] **提升端到端解题率（最高优先）**：评测显示 `stage_runtime`（多阶段交互时序）在 11 题中全部命中，优先加固泄漏读取与交互建模
 - [ ] **扩展 pwn 覆盖面**：堆溢出 / 格式化字符串 / 整数溢出分析（第二版仅覆盖栈溢出）
-- [ ] **新增「与官方 exp 相似度」指标**（当前完成度衡量打通度，未直接反映与官方的接近程度） -->打分评判标准存在问题，直接影响解题率是否虚高或不真实，Algorithm_2解决这个问题
+- [ ] **权重拟合（待补）**：`WEIGHTS` 目前为先验值(0.40/0.30/0.15/0.15)，已证明自洽但未做参数拟合（样本仅 11 题，不宜过度拟合）
 - [ ] 提升 gadget/偏移精度：覆盖更多架构与编译选项下的栈对齐平移等边界情形

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""栈溢出题库批量验证: 逐题跑 refine.py, 与官方 exp 基准对照, 输出对照表.
+"""栈溢出题库批量验证: 逐题跑 analyze.py --refine, 与官方 exp 基准对照, 输出对照表.
 
-须在 WSL/Linux 运行(refine.py 依赖 pwntools 验证真机). 用法:
+须在 WSL/Linux 运行(Algorithm 1 闭环依赖 pwntools 验证真机). 用法:
     python3 test_py/run_stackoverflow_batch.py                 # 跑第一梯队(32位)
     python3 test_py/run_stackoverflow_batch.py --tier all      # 跑全部可测题目
     python3 test_py/run_stackoverflow_batch.py --only ret2libc1
@@ -17,6 +17,11 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SO = os.path.join(ROOT, "test", "user-mode", "stackoverflow")
+
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from analysis.techniques import infer_route  # noqa: E402
 
 # 官方 exp 基准(offset 单位: 字节; tech 为官方技术路线; key 为官方关键地址)
 CASES = [
@@ -63,23 +68,24 @@ CASES = [
      "key": "pop_rdi off=0x21102, 菜单泄漏 system"},
 ]
 
-TECH_HINT = {
-    "ret2text": ["backdoor", "win", "success", "system@plt", "ret2text"],
-    "ret2libc": ["system", "bin/sh", "/bin/sh"],
-    "ret2libc+gadget": ["pop", "system"],
-    "leak(puts)": ["puts", "leak", "recv", "u32"],
-    "leak(program prints)": ["recv", "leak", "u32"],
-    "ret2shellcode": ["shellcraft", "asm", "shellcode"],
-    "ret2shellcode(x64)": ["shellcode", "asm", "\\x0f\\x05"],
-    "ROP leak(write)": ["write", "read", "got", "pop"],
-    "ret2csu": ["csu", "pop r", "pop_r"],
-    "menu leak(system)+pop rdi": ["system", "pop rdi", "rdi"],
+# 官方技术路线 -> 本框架规范路线名(见 analysis/techniques.py:TECHNIQUES)
+EXPECT_ROUTE = {
+    "ret2text": ["ret2text"],
+    "ret2libc": ["ret2libc"],
+    "ret2libc+gadget": ["ret2libc", "ret2libc-leak", "ret2rop"],
+    "leak(puts)": ["ret2libc-leak"],
+    "leak(program prints)": ["ret2libc", "ret2libc-leak"],
+    "ret2shellcode": ["ret2shellcode"],
+    "ret2shellcode(x64)": ["ret2shellcode", "ret2syscall"],
+    "ROP leak(write)": ["ret2libc-leak", "ret2rop"],
+    "ret2csu": ["ret2csu"],
+    "menu leak(system)+pop rdi": ["ret2libc", "ret2libc-leak", "ret2rop"],
 }
 
 def _run_one(case: dict, rounds: int, theta: float, timeout: int) -> dict:
     out_name = f"batch_{case['name']}.json"
-    cmd = [sys.executable, os.path.join(ROOT, "refine.py"), case["path"],
-           "--rounds", str(rounds), "--theta", str(theta),
+    cmd = [sys.executable, os.path.join(ROOT, "analyze.py"), case["path"],
+           "--refine", "--rounds", str(rounds), "--theta", str(theta),
            "--json-out", out_name, "--no-color"]
     rec = {"name": case["name"], "status": "?", "score": 0.0, "pass": False,
            "offset": None, "offset_ok": None, "tech": case["tech"],
@@ -115,10 +121,15 @@ def _run_one(case: dict, rounds: int, theta: float, timeout: int) -> dict:
         cand = {case.get("offset"), case.get("offset2")}
         cand.discard(None)
         rec["offset_ok"] = (off_num in cand) if off_num is not None else False
-        # 技术路线比对
-        blob = (d.get("exp_code") or "") + " " + " ".join(d.get("payload_layout") or [])
-        hints = TECH_HINT.get(case["tech"], [])
-        rec["tech_ok"] = any(h.lower() in blob.lower() for h in hints) if hints else None
+        # 技术路线比对: 优先用 refine 的结构化反推, 退回本地 infer_route
+        used = d.get("route_used")
+        if not used:
+            blob = (d.get("exp_code") or "") + " " + \
+                " ".join(d.get("payload_layout") or [])
+            used = infer_route(blob)
+        rec["routes"] = list(used)
+        expect = EXPECT_ROUTE.get(case["tech"])
+        rec["tech_ok"] = bool(set(used) & set(expect)) if expect else None
     except subprocess.TimeoutExpired:
         rec["status"] = "TIMEOUT"
         rec["note"] = f">{timeout}s"
@@ -144,7 +155,7 @@ def _fmt_table(rows: list) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="run_stackoverflow_batch",
-                                 description="栈溢出题库批量验证(refine.py 对照官方 exp)")
+                                 description="栈溢出题库批量验证(Algorithm 1 对照官方 exp)")
     ap.add_argument("--tier", choices=["1", "2", "all"], default="1",
                     help="1=32位第一梯队(默认), 2=64位, all=全部")
     ap.add_argument("--only", default=None, help="仅跑指定题目名")

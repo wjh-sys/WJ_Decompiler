@@ -119,7 +119,9 @@ def parse_analysis(raw: str) -> FailureAnalysis:
                 kind=_as_str(p.get("kind")).strip(),
                 detail=_as_str(p.get("detail")),
                 target=_as_str(p.get("target")),
+                evidence=_as_str(p.get("evidence")),
             ))
     a.locked = _as_str_list(obj.get("locked"))
     a.reasoning = _as_str(obj.get("reasoning"))
+    a.evidence = _as_str(obj.get("evidence"))
     return a

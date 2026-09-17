@@ -118,6 +118,9 @@ EXP_RULES = """[EXP 编写规范](必须遵守)
 ANALYZE_SYSTEM = """你是二进制漏洞利用(EXP)调试专家。
 你会收到上一轮生成的结构化报告 JSON、当前累积的 Taint/静态证据、以及一次真实沙箱验证的结构化反馈。
 你的唯一职责: 把客观证据翻译成\"结构化问题清单\", 不决定是否重试、不生成 EXP。
+评分与问题都必须引用证据: score 需在 evidence 字段逐条引用证据原文片段(含地址/偏移/阶段等);
+每个 problem 需在 evidence 字段引用支撑它的具体证据或地址。
+未引用证据的评分按 0 分计; 未引用证据的问题不计入扣分。禁止凭空推断(如无证据支持的偏移偏移假设)。
 只输出一个 JSON 对象, 不要输出任何解释性文字或 markdown 围栏。"""
 
 def build_analyze_messages(report, taint, feedback_text: str,
@@ -127,6 +130,8 @@ def build_analyze_messages(report, taint, feedback_text: str,
         "[累积 Taint/静态证据 T]", _taint_text(taint),
         feedback_text,
         "[归因任务] 依据上述客观证据定位 EXP 卡点。problems[].kind 必须取自 schema 枚举; "
+        "problems[].evidence 必须引用支撑该问题的证据原文或地址, score 的 evidence 必须逐条引用证据片段; "
+        "未引用证据的评分按 0 分计, 未引用证据的问题不计入扣分; "
         "locked 列出本轮确凿、下一轮禁止改动的字段路径(如 exploit_plan.offset)。",
         "按以下 JSON schema 输出(不要输出其他任何内容):",
         json.dumps(schema, ensure_ascii=False, indent=2),

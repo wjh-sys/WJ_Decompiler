@@ -20,8 +20,29 @@ SOURCE_BUF_ARG = {
     "recv": (1, 2), "getline": (0, 2),
 }
 EXEC_FUNCS = {"system", "execve", "execl", "execlp", "execvp", "popen"}
+# 写入型拷贝: 若目标为 .data/.bss 的固定地址, 该地址在非 PIE 下固定,
+# 是 shellcode 的落点(经典 ret2shellcode: gets(buf) 后 strncpy(buf2, buf, n)).
+COPY_FUNCS = {"strcpy", "strncpy", "strcat", "strncat", "sprintf",
+              "snprintf", "vsprintf", "memcpy", "memmove"}
 SUSPECT_STR = re.compile(r"/bin/sh|/system|shell|flag|cat /|> /|/bin/cat|sh\"|sh'|/bin/bash", re.I)
 SUSPECT_NAME = re.compile(r"win|backdoor|shell|system|flag|secret|hack|pwn|secure|vuln", re.I)
+_REAL_CMD = re.compile(r"/bin/sh|\bsh\b|/bin/bash|\bbash\b|\bflag\b|/bin/cat|\bcat\b", re.I)
+_KIND_RANK = {"jump_target": 2, "decoy": 1, "exec_site": 0}
+
+def _is_true_backdoor(prog, sites) -> bool:
+    """判断名字可疑的函数是否为真实后门(可作跳转目标).
+
+    无 exec 调用证据时保守保留(避免漏判只靠名字的真后门);
+    有 exec 调用但参数均非真实 getshell/读flag 命令(如 system("shell!?"))
+    则判为诱饵, 不进入可利用目标.
+    """
+    if not sites or prog is None:
+        return True
+    for ce in sites:
+        for a in ce.args:
+            if isinstance(a, Const) and _REAL_CMD.search(prog.string_at(a.val) or ""):
+                return True
+    return False
 REGS32 = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"}
 REGS64 = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
           "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"}
@@ -50,6 +71,7 @@ class Backdoor:
     name: str
     addr: int
     note: str
+    kind: str = "jump_target"   # jump_target(函数名可疑, 可作跳转目标) | exec_site(仅调用 exec)
 
 @dataclass
 class Target:
@@ -109,6 +131,12 @@ class Evidence:
             for u in self.unreachable:
                 L.append(f"  {u['name']} @ 0x{u['addr']:x}")
         L.append("")
+        decoys = [b for b in self.backdoors if getattr(b, "kind", "") == "decoy"]
+        if decoys:
+            L.append("[疑似诱饵函数(不可直接跳转, 勿选作 ret2text 目标)]")
+            for d in decoys:
+                L.append(f"  {d.name} @ 0x{d.addr:x}: {d.note}")
+            L.append("")
         L.append("[可利用目标]")
         for t in self.targets:
             L.append(f"  {t.kind:<9} {t.name}  {t.detail}")
@@ -142,7 +170,104 @@ class Evidence:
             seen.add(f["addr"])
             mark = "" if f["reachable"] else "(不可达)"
             L.append(f"  {f['name']} @ 0x{f['addr']:x} {mark}".rstrip())
+        from .listtable import ListTable
+        from .techniques import eval_routes, render_routes
+        L.append("")
+        L.append(render_routes(eval_routes(ListTable.from_evidence(self))))
         return "\n".join(L)
+
+def _hx(a) -> str:
+    try:
+        return f"0x{int(str(a), 0):x}"
+    except (TypeError, ValueError):
+        return str(a).strip().lower()
+
+def _iv(v):
+    try:
+        return int(str(v), 0)
+    except (TypeError, ValueError):
+        return None
+
+@dataclass
+class ToolEntry:
+    """List Table 统一行模型: 所有证据归一成同一结构."""
+    key: str
+    category: str
+    name: str
+    addr: int | None
+    detail: str
+    source: str
+    tags: list = field(default_factory=list)
+
+@dataclass
+class LookupResult:
+    """四态反查结果: HIT(精确) | DERIVED(可推导) | SECTION(分区存在) | MISS(无分区)."""
+    status: str
+    entries: list = field(default_factory=list)
+    hint: str = ""
+
+class ListTable:
+    """Evidence 的派生索引层: 供 prompt 渲染 / resolver 反查 / 路线可行性判定共用."""
+
+    def __init__(self, entries: list):
+        self.entries = sorted(entries, key=lambda e: (e.category, e.addr or 0, e.key))
+        self.index: dict = {}
+        self.by_cat: dict = {}
+        self.by_tag: dict = {}
+        for e in self.entries:
+            self.index.setdefault(e.key, e)
+            self.by_cat.setdefault(e.category, []).append(e)
+            for t in e.tags:
+                self.by_tag.setdefault(t, []).append(e)
+
+    @classmethod
+    def from_evidence(cls, ev, prog=None) -> "ListTable":
+        E: list = []
+        for t in getattr(ev, "targets", []) or []:
+            E.append(ToolEntry(f"sym:{t.name.lower()}", "sym", t.name, _iv(t.detail),
+                               f"{t.kind} {t.name} @ {t.detail}",
+                               "plt" if t.kind == "plt" else "symtab",
+                               ["exec"] if t.name in EXEC_FUNCS else []))
+        for b in getattr(ev, "backdoors", []) or []:
+            E.append(ToolEntry(f"bd:{_hx(b.addr)}", "backdoor", b.name, b.addr,
+                               b.note, "symtab", ["backdoor"]))
+        for g in getattr(ev, "gadgets", []) or []:
+            E.append(ToolEntry(f"gadget:{_hx(g['addr'])}", "gadget", g.get("asm", ""),
+                               g.get("addr"), g.get("asm", ""), "disasm",
+                               [g.get("cat", "other")]))
+        for s in getattr(ev, "strings", []) or []:
+            E.append(ToolEntry(f"str:{s['text'].lower()}", "str", s["text"], s["addr"],
+                               repr(s["text"]), "string-scan", ["suspicious"]))
+        for o in getattr(ev, "overflow", []) or []:
+            E.append(ToolEntry(f"offset:{o.func}", "offset", o.func, o.offset_to_ret,
+                               f"{o.call} -> saved-ret {o.offset_to_ret}", "taint",
+                               ["saved_ret"]))
+        for f in getattr(ev, "funcs", []) or []:
+            E.append(ToolEntry(f"func:{_hx(f['addr'])}", "func", f["name"], f["addr"],
+                               f["name"], "symtab",
+                               ["reachable"] if f.get("reachable") else []))
+        for k, v in (getattr(ev, "libc", {}) or {}).items():
+            if k == "path":
+                continue
+            E.append(ToolEntry(f"libc:{k.lower()}", "libc", k,
+                               v if isinstance(v, int) else None,
+                               _hx(v) if isinstance(v, int) else str(v), "libc",
+                               ["leak_src"]))
+        p = getattr(ev, "protections", {}) or {}
+        pt = []
+        if p.get("NX") == "off":
+            pt.append("nx_off")
+        if p.get("PIE") != "on":
+            pt.append("no_pie")
+        if str(p.get("Canary", "")).lower() in ("no", "off", "false", "none", ""):
+            pt.append("no_canary")
+        if "partial" in str(p.get("RELRO", "")).lower() or \
+                str(p.get("RELRO", "")).lower() in ("no", "off"):
+            pt.append("relro_weak")
+        if pt:
+            E.append(ToolEntry("prot:main", "prot", "protections", None,
+                               ",".join(pt), "detect", pt))
+        return cls(E)
 
 @dataclass
 class _CallEv:
@@ -449,6 +574,7 @@ class TaintAnalyzer:
                 b"\x41\x5e\xc3": "pop r14; ret",
                 b"\x41\x5c\xc3": "pop r12; ret",
                 b"\xc9\xc3": "leave; ret",
+                b"\x0f\x05": "syscall",
                 b"\x41\x5c\x41\x5d\x41\x5e\x41\x5f\xc3":
                     "pop r12; pop r13; pop r14; pop r15; ret",
             }
@@ -469,7 +595,7 @@ class TaintAnalyzer:
         # 通道2: 滑窗反汇编(从每个偏移尝试解码, 收集以 ret 结尾的短 gadget)
         ok_ops = {"pop", "nop", "leave", "xchg", "add", "sub", "xor",
                   "mov", "inc", "dec", "and", "or", "shl", "shr", "sar",
-                  "neg", "not", "test"}
+                  "neg", "not", "test", "syscall"}
         cap = min(len(data), 0x10000)
         md = self.dis.cs
         for i in range(cap):
@@ -517,7 +643,7 @@ class TaintAnalyzer:
         reach = self._reachable_map()
 
         func_syscalls: dict[int, list] = {}
-        raw_sinks: list = []
+        gbufs: dict = {}
 
         for addr in sorted(self.graph._func_addrs):
             name = self.resolve(addr)
@@ -579,15 +705,37 @@ class TaintAnalyzer:
                     })
                 if callee_name in EXEC_FUNCS:
                     func_syscalls.setdefault(addr, []).append(ce)
-                if callee_name in {"strcpy", "strcat", "sprintf", "vsprintf"}:
-                    raw_sinks.append((addr, ce))
+                if callee_name in COPY_FUNCS:
+                    # 必须用当前调用的 ce.args: 上面 SOURCES 分支里的 args 属于
+                    # 另一个调用(如先前的 gets), 复用它会把拷贝目标取错
+                    cargs = ce.args
+                    dst = cargs[0] if cargs else None
+                    dst_addr = None
+                    if isinstance(dst, Const):
+                        dst_addr = dst.val
+                    elif isinstance(dst, Mem) and isinstance(dst.addr, Const):
+                        dst_addr = dst.addr.val
+                    if dst_addr:
+                        sec = self.prog.find_section(dst_addr)
+                        if sec is not None and "w" in (sec.perm or ""):
+                            gbufs.setdefault(dst_addr, callee_name)
 
         for addr in sorted(self.graph._func_addrs):
             name = self.resolve(addr)
             ev.funcs.append({"name": name, "addr": addr, "reachable": addr in reach})
+            sites = func_syscalls.get(addr, [])
             if SUSPECT_NAME.search(name):
-                ev.backdoors.append(Backdoor(name, addr, "函数名可疑,值得作为跳转目标考察"))
-            for ce in func_syscalls.get(addr, []):
+                if _is_true_backdoor(self.prog, sites):
+                    ev.backdoors.append(Backdoor(name, addr,
+                                                 "函数名可疑,值得作为跳转目标考察",
+                                                 "jump_target"))
+                else:
+                    ev.backdoors.append(Backdoor(
+                        name, addr,
+                        "函数名可疑但 exec 参数非真实 shell/flag 命令, 疑为诱饵"
+                        "(需满足前置条件才触发), 不宜作为跳转目标",
+                        "decoy"))
+            for ce in sites:
                 note = f"调用 {self.resolve(ce.target)}"
                 argstr = ", ".join(self._fmt_expr(a) for a in ce.args)
                 if argstr:
@@ -597,7 +745,7 @@ class TaintAnalyzer:
                             s = self.prog.string_at(a.val)
                             if s and SUSPECT_STR.search(s):
                                 note += f";参数字符串含可疑内容: {s!r}"
-                ev.backdoors.append(Backdoor(name, addr, note))
+                ev.backdoors.append(Backdoor(name, addr, note, "exec_site"))
 
         for s in self.prog.symbols:
             if s.name in EXEC_FUNCS:
@@ -608,9 +756,31 @@ class TaintAnalyzer:
 
         ev.gadgets = self._scan_gadgets()
 
+        # 全局可写缓冲: 输入经 strncpy/memcpy 等被复制到 .data/.bss 的固定地址.
+        # 非 PIE 下该地址固定, 可直接作为 shellcode 落点; 缺失此事实时模型只能
+        # 去猜不可知的栈地址, 导致整轮空转(如 ret2shellcode-example).
+        for a, fn in sorted(gbufs.items()):
+            sec = self.prog.find_section(a)
+            seg_x = self.prog.is_executable(a)
+            nx_off = (ev.protections or {}).get("NX") == "off"
+            if seg_x:
+                note = "所在段可执行(RWX): 可直接跳转执行置于此处的 shellcode"
+            elif nx_off:
+                note = ("NX 关闭(无硬件 NX 保护). 注意: NX=off 仅保证栈可执行, "
+                        "此处是否可执行取决于内核是否赋予 READ_IMPLIES_EXEC"
+                        "(老式 32 位行为; 现代内核多已收紧, 需实测确认): "
+                        "若可执行, 可将 shellcode 经拷贝落入此处并跳转")
+            else:
+                note = "所在段不可执行且 NX 开启: 仅可作数据落点, 勿作为跳转目标"
+            ev.targets.append(Target(
+                "global_buf", self.resolve(a) or "?",
+                f"0x{a:x} ({fn} 目标, {sec.name if sec else '?'} 可写; {note}; "
+                f"非 PIE 下地址固定)"))
+
         ev.backdoors = _dedup_backdoor(ev.backdoors)
         for b in ev.backdoors:
-            ev.targets.append(Target("backdoor", b.name, f"0x{b.addr:x}"))
+            if getattr(b, "kind", "jump_target") == "jump_target":
+                ev.targets.append(Target("backdoor", b.name, f"0x{b.addr:x}"))
         return ev
 
 
@@ -619,8 +789,13 @@ def _dedup_backdoor(items) -> list:
     best: dict[int, Backdoor] = {}
     for b in items:
         old = best.get(b.addr)
-        if old is None or ("调用" in b.note and "调用" not in old.note):
+        if old is None:
             best[b.addr] = b
+            continue
+        merged = b if ("调用" in b.note and "调用" not in old.note) else old
+        kind = max((old, b),
+                   key=lambda x: _KIND_RANK.get(getattr(x, "kind", ""), 0)).kind
+        best[b.addr] = Backdoor(merged.name, merged.addr, merged.note, kind)
     return [best[k] for k in sorted(best)]
 
 def _gadget_cat(asm: str) -> str:

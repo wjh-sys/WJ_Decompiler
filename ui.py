@@ -228,8 +228,15 @@ def render_diagnosis(J, I) -> None:
                         "red"))
     print(box("缺口诊断 (静态核对)", lines, "yellow"))
 
-def render_analysis(A, theta: float) -> None:
-    lines = [f"完成度  : {_bar(_get(A, 'score') or 0.0)}   (阈值 {theta})"]
+def render_analysis(A, theta: float, score=None) -> None:
+    val = float(_get(A, "score") or 0.0) if score is None else float(score)
+    lines = [f"完成度  : {_bar(val)}   (阈值 {theta})"]
+    ev = _get(A, "evidence")
+    if ev:
+        lines.append(_c("证据引用: ", "cyan") + str(ev)[:200])
+    else:
+        lines.append(_c("证据引用: ", "cyan")
+                     + _c("(无) -> 主观评分不计分", "red"))
     if _get(A, "actually_passed"):
         lines.append(_c("● 模型判断: 其实已打通(探活可能误判)", "green", "bold"))
     lines += ["", _c("● 大模型归因(思考):", "cyan")]
@@ -250,6 +257,12 @@ def render_analysis(A, theta: float) -> None:
         lines.append(f"     {desc}" + (f"  target={target}" if target else ""))
         for seg in (_wrap(detail, _w() - 8) if detail else []):
             lines.append("     " + seg)
+        pev = _get(p, "evidence")
+        if pev:
+            for seg in _wrap("证据: " + str(pev), _w() - 8)[:3]:
+                lines.append(_c("     " + seg, "gray"))
+        else:
+            lines.append(_c("     证据: (无) -> 不计入扣分", "red"))
     locked = _get(A, "locked") or []
     if locked:
         lines += ["", _c("● 锁定字段(下轮禁止改动): ", "cyan") + ", ".join(locked)]
@@ -296,10 +309,12 @@ def render_solving(A, J, applied) -> None:
         lines.append(_c("锁定回填 : ", "cyan") + ", ".join(applied))
     print(box("LLMRegenerate 新 EXP (解题过程)", lines, "cyan"))
 
-def record(k, F, A, hit, total, locked) -> dict:
+def record(k, F, A, hit, total, locked, score=None) -> dict:
     kinds = [str(_get(p, "kind")) for p in ((_get(A, "problems") or []) if A else [])]
+    if score is None:
+        score = float(_get(A, "score") or 0.0) if A else 0.0
     return {"round": k, "stage": _get(F, "stage") or "?",
-            "score": float(_get(A, "score") or 0.0) if A else 0.0,
+            "score": float(score),
             "kinds": [x for x in kinds if x], "hit": hit, "total": total,
             "locked": list(locked or [])}
 

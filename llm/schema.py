@@ -104,6 +104,7 @@ class Problem:
     kind: str = ""
     detail: str = ""
     target: str = ""
+    evidence: str = ""
 
 @dataclass
 class FailureAnalysis:
@@ -112,22 +113,28 @@ class FailureAnalysis:
     problems: list = field(default_factory=list)
     locked: list = field(default_factory=list)
     reasoning: str = ""
+    evidence: str = ""
 
 ANALYSIS_SCHEMA = {
     "type": "object",
     "properties": {
         "score": {"type": "number", "minimum": 0, "maximum": 1,
                   "description": "对当前 EXP 完成度的评估(0~1),达到阈值即收敛"},
+        "evidence": {"type": "string",
+                     "description": "支撑 score 的证据引用: 必须逐条引用观测到的证据原文片段(如 '静态实测 offset 112 与报告一致'、'stage=segv 且回显为空')。空串或无据的评分按 0 分计, 不计入总分"},
         "actually_passed": {"type": "boolean",
                             "description": "若证据表明 EXP 其实已打通(仅探活误判),置 true"},
         "problems": {"type": "array", "items": {"type": "object", "properties": {
             "kind": {"type": "string", "enum": PROBLEM_KINDS},
             "detail": {"type": "string"},
             "target": {"type": "string"},
+            "evidence": {"type": "string",
+                         "description": "支撑该问题的具体证据片段(引用证据原文或地址); 无引用的问题不计入扣分"},
         }}, "description": "把客观证据翻译成的结构化问题清单"},
         "locked": {"type": "array", "items": {"type": "string"},
                    "description": "本轮确凿、下一轮禁止改动的字段路径,如 exploit_plan.offset"},
         "reasoning": {"type": "string", "description": "归因简述"},
     },
-    "required": ["score", "actually_passed", "problems", "locked", "reasoning"],
+    "required": ["score", "evidence", "actually_passed", "problems", "locked",
+                 "reasoning"],
 }
