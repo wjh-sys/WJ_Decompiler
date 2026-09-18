@@ -58,8 +58,9 @@ TECHNIQUES = [
           note="格式化字符串泄漏 canary/libc/栈地址(通常作为其他路线的前置)"),
     Route("canary-bypass", "canary", ["offset:*", "sym:printf", "prot:canary_on"], rank=42,
           note="先泄 canary, 再正常溢出覆盖返回地址(仅在 Canary 开启时适用)"),
-    Route("stack-pivot", "stack", ["gadget:leave"], rank=50,
-          note="溢出空间不足: 用 leave;ret 把栈迁移到可写区(受限时的兜底)"),
+    Route("stack-pivot", "stack",
+          [["gadget:leave", "gadget:jmp esp", "gadget:jmp rsp"]], rank=50,
+          note="溢出空间不足: 用 leave;ret 或 jmp esp/寄存器 把栈迁移到可控区"),
     Route("partial-overwrite", "control-flow", ["offset:*", "prot:pie_on"], rank=60,
           note="只覆盖返回地址低字节(1~2 byte)绕 PIE/ASLR, 需爆破", advisory=True),
 ]
@@ -81,7 +82,8 @@ ROUTE_MARKERS = {
                     ["execve"]],
     "srop": [["sigreturn"], ["srop"]],
     "ret2rop": [["rop."], ["rop("], ["pop_rdi"], ["pop rdi"], ["flat("]],
-    "stack-pivot": [["pivot"], ["xchg eax, esp"], ["xchg rax, rsp"]],
+    "stack-pivot": [["pivot"], ["xchg eax, esp"], ["xchg rax, rsp"],
+                    ["jmp esp"], ["jmp rsp"], ["push esp"], ["push rsp"]],
     "format-leak": [["fmtstr"], ["%p"], ["format_string"], ["%n"]],
     "canary-bypass": [["canary"], ["__stack_chk"]],
     "partial-overwrite": [["partial"], ["低字节"], ["p8("], ["p16("],
@@ -94,8 +96,14 @@ def eval_routes(table, techs=None) -> list:
     for t in (techs or TECHNIQUES):
         sat, miss = [], []
         for cap in t.requires:
-            st = table.cap_status(cap).status
-            (sat if st in ("HIT", "DERIVED") else miss).append(cap)
+            # 字符串=单项能力(与其他项 AND); 列表/元组=可替代项(内部 OR)
+            if isinstance(cap, (list, tuple)):
+                sts = [table.cap_status(c).status for c in cap]
+                ok = any(s in ("HIT", "DERIVED") for s in sts)
+                (sat if ok else miss).append("|".join(cap))
+            else:
+                st = table.cap_status(cap).status
+                (sat if st in ("HIT", "DERIVED") else miss).append(cap)
         status = "AVAILABLE" if not miss else ("PARTIAL" if sat else "BLOCKED")
         out.append(Route(name=t.name, family=t.family, requires=list(t.requires),
                          status=status, satisfied=sat, missing=miss, note=t.note,

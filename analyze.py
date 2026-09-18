@@ -557,7 +557,11 @@ def refine(binary: str, addr: str | None, depth: int, max_nodes: int, config,
 
     ui.render_banner(binary, rounds, theta)
     ui.render_round_zero(J, I, nodes, root)
-    T = [I.to_prompt_text()]
+    # 注入真实二进制路径: 否则模型习惯性使用占位名 './pwn', 每个 EXP 都需人工替换
+    T = [I.to_prompt_text(),
+         f"[目标二进制] 生成 EXP 时 process() 必须使用 {binary!r} "
+         f"(或相对名 {os.path.basename(binary)!r}); "
+         f"禁止使用 './pwn' 等占位名"]
     F = run_verify(binary, J, flag=flag, timeout=timeout)
     client = LLMClient(config)
     H: list = []

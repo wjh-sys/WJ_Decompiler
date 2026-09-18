@@ -562,6 +562,8 @@ class TaintAnalyzer:
             b"\x94\xc3": "xchg eax, esp; ret",
             b"\x5a\x59\x5b\xc3": "pop edx; pop ecx; pop ebx; ret",
             b"\x58\x59\x5a\x5b\xc3": "pop eax; pop ecx; pop edx; pop ebx; ret",
+            b"\xff\xe4": "jmp esp",
+            b"\x54\xc3": "push esp; ret",
         }
         if self.bits == 64:
             want = {
@@ -575,6 +577,8 @@ class TaintAnalyzer:
                 b"\x41\x5c\xc3": "pop r12; ret",
                 b"\xc9\xc3": "leave; ret",
                 b"\x0f\x05": "syscall",
+                b"\xff\xe4": "jmp rsp",
+                b"\x54\xc3": "push rsp; ret",
                 b"\x41\x5c\x41\x5d\x41\x5e\x41\x5f\xc3":
                     "pop r12; pop r13; pop r14; pop r15; ret",
             }
@@ -809,7 +813,9 @@ def _gadget_cat(asm: str) -> str:
              if i.split()[0] not in ("ret", "retf")]
     if not mnems:
         return "other"
-    if any(m == "leave" or m.startswith("xchg") for m in mnems):
+    if any(m == "leave" or m.startswith("xchg") for m in mnems) \
+            or (any(m in ("jmp", "call", "push") for m in mnems)
+                and ("esp" in asm or "rsp" in asm)):
         return "stack-pivot"
     if all(m == "pop" for m in mnems):
         return "reg-set"
